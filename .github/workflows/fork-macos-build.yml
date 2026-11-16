@@ -42,12 +42,16 @@ jobs:
         run: cargo fmt -- --check
 
       - name: Run clippy
+        if: ${{ !cancelled() }}
         run: cargo clippy --all-targets -- -D warnings
 
+      # Lint failures must not hide test results, so the suite runs regardless.
       - name: Build release binary for tests
+        if: ${{ !cancelled() }}
         run: cargo build --release --locked
 
       - name: Run the full test suite
+        if: ${{ !cancelled() }}
         run: cargo nextest run --profile ci --no-fail-fast
 
       - name: Upload test results
