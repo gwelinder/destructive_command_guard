@@ -13366,6 +13366,16 @@ pub(crate) fn quoted_heredoc_body_at(command: &str, operator_start: usize) -> Op
         })
 }
 
+/// The bodies of every heredoc in `command` whose delimiter is quoted. The
+/// shell expands nothing in such a body, so none of its bytes run in the shell
+/// that reads the command; only the command that reads the body can run it.
+pub(crate) fn quoted_heredoc_bodies(command: &str) -> Vec<Range<usize>> {
+    quoted_bodies_by_operator(&active_heredocs(command).unwrap_or_default())
+        .into_iter()
+        .map(|(_, body)| body)
+        .collect()
+}
+
 /// The quoted-delimiter bodies among `heredocs`, with their operator
 /// positions, for [`command_may_run_heredoc_output`].
 fn quoted_bodies_by_operator(heredocs: &[ActiveHeredoc]) -> Vec<(usize, Range<usize>)> {

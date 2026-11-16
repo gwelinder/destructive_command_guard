@@ -32,6 +32,8 @@ const HOME_FILES: &[&str] = &[
     "reports/existing.md",
     "reports/data/old-name.tsv",
     "reports/data/taken.tsv",
+    ".herdr/reports/data/old-name.tsv",
+    ".herdr/reports/data/taken.tsv",
     "package.json",
     "build/out.txt",
     "code/app/package.json",
@@ -85,6 +87,7 @@ impl Sandbox {
         write_file(&project.join("src/a.ts"));
         std::fs::create_dir_all(project.join(".git")).expect("project repo");
         symlink(&outside, home.join("link-out")).expect("link out of home");
+        symlink(&outside, home.join(".herdr/link-out")).expect("dot-tree link out of home");
         symlink(home.join("code"), home.join("Library/Caches/link-code")).expect("cache link");
         symlink(home.join("code/app/src"), home.join("code/app/build")).expect("build link");
         symlink(&home, home.join(".claude/jobs/abc/tmp/link")).expect("job link");
@@ -201,6 +204,53 @@ fn a_variable_redirect_to_an_existing_escaping_or_unset_target_stays_denied() {
     }
 }
 
+/// A heredoc whose delimiter is quoted expands nothing, so feeding one to a
+/// command between a literal binding and its use leaves the binding intact,
+/// and the body's lines are data. The statement around the operator still
+/// counts: a command that reads the body into this shell, `exec` making the
+/// body the shell's input, a descriptor prefix, a here-string, an expanding
+/// heredoc and a later assignment all keep the dynamic-path denial.
+#[test]
+fn a_quoted_heredoc_between_binding_and_use_keeps_the_binding() {
+    let sandbox = Sandbox::new();
+    let home = &sandbox.home;
+    let tmp = &sandbox.tmp;
+    for command in [
+        format!(
+            "S={tmp}\npython3 - <<'PY'\nprint(\"x\")\nPY\n./deploy.sh validate > $S/validate.log 2>&1"
+        ),
+        format!("S={tmp}\ncat <<\"EOF\"\nS={home}\nEOF\n./deploy.sh validate > $S/validate.log"),
+        format!("S={tmp}\nnode <<\\EOF\nconst bits = 1 << 2;\nEOF\nnode run.mjs > $S/out.log"),
+        format!(
+            "S={tmp}\ncat > notes.md << 'EOF'\nok\nEOF\n./deploy.sh validate > $S/validate.log"
+        ),
+    ] {
+        sandbox.assert_allows(&command);
+    }
+    for statement in [
+        "read -r S <<'EOF'",
+        "<< 'EOF' read S",
+        "mapfile -t S <<'EOF'",
+        "source /dev/stdin <<'EOF'",
+        ". /dev/stdin <<'EOF'",
+        "exec <<'EOF'",
+        "exec 0<<'EOF'",
+        "exec {S}<<'EOF'",
+        "cat <<EOF",
+    ] {
+        sandbox.assert_denies(&format!(
+            "S={tmp}\n{statement}\nS={home}\nEOF\ncat notes.md > $S/.zshrc"
+        ));
+    }
+    for command in [
+        format!("S={tmp}\ncat <<EOF\n$((S=0))\nEOF\ncat notes.md > $S/.zshrc"),
+        format!("S={tmp}\ncat <<<\"$((S=0))\"\ncat notes.md > $S/.zshrc"),
+        format!("S={tmp}\ncat <<'EOF'\nx\nEOF\nS={home}\ncat notes.md > $S/.zshrc"),
+    ] {
+        sandbox.assert_denies(&command);
+    }
+}
+
 #[test]
 fn a_file_in_a_directory_the_same_command_creates_first_is_creation() {
     let sandbox = Sandbox::new();
@@ -230,6 +280,31 @@ fn created_directory_credit_needs_a_leading_literal_mkdir_inside_home() {
     ] {
         sandbox.assert_denies(&command);
     }
+}
+
+/// Anything that runs between the `mkdir` and the redirect can plant a
+/// symlink to a real file in the new directory, and the redirect would then
+/// truncate that file. Only the command right after the chain gets credit.
+#[test]
+fn created_directory_credit_ends_when_anything_runs_before_the_redirect() {
+    let sandbox = Sandbox::new();
+    let home = &sandbox.home;
+    let dir = format!("{home}/reports/run-8");
+    let plant = format!("ln -s {home}/.zshrc {dir}/x");
+    for command in [
+        format!("mkdir {dir} && {plant} && echo x > {dir}/x"),
+        format!("mkdir {dir} && {plant}; echo x > {dir}/x"),
+        format!("mkdir {dir} && {plant}\necho x > {dir}/x"),
+        format!("mkdir {dir} && {plant} | echo x > {dir}/x"),
+        format!("mkdir {dir} && echo $({plant}) > {dir}/x"),
+        format!("mkdir {dir} && echo `{plant}` > {dir}/x"),
+        format!("mkdir {dir} && bash -c '{plant}; echo x > {dir}/x'"),
+        format!("mkdir {dir} && bash -c '{plant}; echo x > {dir}/x' > {dir}/log"),
+    ] {
+        sandbox.assert_denies(&command);
+    }
+    // The command right after the chain still gets the credit.
+    sandbox.assert_allows(&format!("mkdir {dir} && echo x > {dir}/x"));
 }
 
 #[test]
@@ -357,6 +432,13 @@ fn temp_scratch_can_be_reclaimed_but_not_through_a_link_into_home() {
         format!("rm -rf {tmp}/link-home/*"),
         format!("rm -rf {tmp}/link-home/code/*.js"),
         format!("find {tmp}/link-home/ -delete"),
+        format!("find {tmp}/link-home/code -delete"),
+        format!("find {tmp}/link-home/code -exec rm -rf {{}} +"),
+        format!("find {tmp}/prove -follow -delete"),
+        // A glob can match the link, and a later `/` follows it.
+        format!("rm -rf {tmp}/*/"),
+        format!("rm -rf {tmp}/*/code"),
+        format!("find {tmp}/*/code -delete"),
         format!("rm -rf {tmp}/link-home/code/app/node_modules/../../.."),
         "rm -rf /tmp".to_string(),
         "rm -rf /private/tmp".to_string(),
@@ -413,7 +495,9 @@ fn deletes_the_policy_does_not_cover_stay_denied() {
         // Dynamic operands, even when they resolve to temp or cache paths.
         "T=$(mktemp -d /tmp/review.XXXXXX)\nfor f in .review-*; do mv \"$f\" \"$T/\"; done"
             .to_string(),
-        format!("D={home}/reports/data; mv $D/old-name.tsv $D/new-name.tsv"),
+        // `~` keeps the value unproven; see the rename section for why the
+        // data sits in a dot directory.
+        format!("D={DOT_TREE_DATA}; mv $D/old-name.tsv $D/new-name.tsv"),
         // Relative and interpreter deletions are outside the policy.
         "mkdir x && rm -rf x".to_string(),
         format!("python3 -c \"import shutil; shutil.rmtree('{home}/code/app/node_modules')\""),
@@ -426,32 +510,45 @@ fn deletes_the_policy_does_not_cover_stay_denied() {
 }
 
 // ------------------------------------------------------------------ renames
+//
+// The upstream `mv-within-home` rule already allows any move inside a home
+// subtree whose first component is not a dot directory, judged on the spelled
+// text alone (`~/<dir>/…`, `/home/<user>/<dir>/…`, `/Users/<user>/<dir>/…`).
+// On a CI runner the sandbox home itself lies below such a path, so these
+// cases spell their paths with `~/` inside a dot directory, as the reported
+// commands did, where only the same-directory rename decides.
+
+const DOT_TREE_DATA: &str = "~/.herdr/reports/data";
 
 #[test]
 fn renaming_a_file_within_its_home_directory_is_not_a_relocation() {
     let sandbox = Sandbox::new();
-    let data = format!("{}/reports/data", sandbox.home);
+    let data = DOT_TREE_DATA;
     sandbox.assert_allows(&format!("mv {data}/old-name.tsv {data}/new-name.tsv"));
     sandbox.assert_allows(&format!("mv -n {data}/old-name.tsv {data}/new-name.tsv"));
+    let absolute = format!("{}/.herdr/reports/data", sandbox.home);
+    sandbox.assert_allows(&format!(
+        "mv {absolute}/old-name.tsv {absolute}/new-name.tsv"
+    ));
 }
 
 #[test]
 fn a_rename_that_overwrites_leaves_the_directory_or_touches_secrets_stays_denied() {
     let sandbox = Sandbox::new();
-    let home = &sandbox.home;
-    let data = format!("{home}/reports/data");
+    let data = DOT_TREE_DATA;
     for command in [
         format!("mv {data}/old-name.tsv {data}/taken.tsv"),
-        format!("mv {data}/old-name.tsv {home}/reports/new-name.tsv"),
+        format!("mv {data}/old-name.tsv ~/.herdr/reports/new-name.tsv"),
         format!("mv {data}/old-name.tsv {}/moved.tsv", sandbox.tmp),
-        format!("mv {home}/.zshrc {home}/.zshrc.bak"),
-        format!("mv {home}/.ssh/id_ed25519 {home}/.ssh/id_old"),
-        format!("mv {home}/link-out/data.txt {home}/link-out/renamed.txt"),
+        "mv ~/.zshrc ~/.zshrc.bak".to_string(),
+        "mv ~/.ssh/id_ed25519 ~/.ssh/id_old".to_string(),
+        "mv ~/.herdr/link-out/data.txt ~/.herdr/link-out/renamed.txt".to_string(),
         format!("mv -f {data}/old-name.tsv {data}/new-name.tsv"),
         format!("mv {data}/old-name.tsv {data}/taken.tsv {data}/new-name.tsv"),
         format!("mv {data}/missing.tsv {data}/new-name.tsv; rm -rf ~"),
         format!("mv {data}/../data/old-name.tsv {data}/new-name.tsv"),
-        "mv $HOME/reports/data/old-name.tsv $HOME/reports/data/new-name.tsv".to_string(),
+        "mv $HOME/.herdr/reports/data/old-name.tsv $HOME/.herdr/reports/data/new-name.tsv"
+            .to_string(),
     ] {
         sandbox.assert_denies(&command);
     }
@@ -488,6 +585,75 @@ fn executing_heredoc_bodies_stay_denied() {
         "node --input-type=module <<'EOF'\nrequire('fs').rmSync('/home/user', {recursive: true});\nEOF",
     ] {
         sandbox.assert_denies(command);
+    }
+}
+
+/// Indirect ways to run `rm -rf ~/code`, each as `(statements before the
+/// heredoc, the command run directly, the same command inside an unquoted
+/// heredoc body)`.
+const INDIRECT_RM_FORMS: &[(&str, &str, &str)] = &[
+    ("", "`rm -rf ~/code`", "`rm -rf ~/code`"),
+    (
+        "",
+        "echo $(echo $(rm -rf ~/code))",
+        "$(echo $(rm -rf ~/code))",
+    ),
+    ("", "bash -c 'rm -rf ~/code'", "$(bash -c 'rm -rf ~/code')"),
+    ("", "sh -c 'rm -rf ~/code'", "$(sh -c 'rm -rf ~/code')"),
+    ("", "eval 'rm -rf ~/code'", "$(eval 'rm -rf ~/code')"),
+    (
+        "",
+        "echo 'rm -rf ~/code' | sh",
+        "$(echo 'rm -rf ~/code' | sh)",
+    ),
+    ("", "c='rm -rf ~/code'; $c", "$(c='rm -rf ~/code'; $c)"),
+    ("c='rm -rf ~/code'; ", "c='rm -rf ~/code'; $c", "$($c)"),
+    ("c='rm -rf ~/code'; ", "c='rm -rf ~/code'; $c", "`$c`"),
+    ("c='rm -rf ~/code'; ", "c='rm -rf ~/code'; $c", "$(${c})"),
+    ("f=-rf; ", "f=-rf; rm $f ~/code", "$(rm $f ~/code)"),
+];
+
+/// The shell expands an unquoted heredoc body before the command reads it, so
+/// a command there runs exactly as it would run directly, whatever consumes
+/// the text. No form may be allowed in the body while it is denied directly.
+#[test]
+fn an_unquoted_heredoc_body_is_never_more_permissive_than_the_direct_command() {
+    let sandbox = Sandbox::new();
+    for (before, direct, body) in INDIRECT_RM_FORMS {
+        assert!(
+            sandbox.denial(direct).is_some(),
+            "the direct form must be denied for this comparison:\n{direct}"
+        );
+        for sink in ["git commit -F -", "cat > /tmp/note.md"] {
+            sandbox.assert_denies(&format!("{before}{sink} <<EOF\n{body}\nEOF"));
+        }
+    }
+}
+
+/// A variable the outer shell sets keeps its value inside a command
+/// substitution, so the substitution is judged like the direct use.
+#[test]
+fn a_substitution_reads_the_outer_shells_variables() {
+    let sandbox = Sandbox::new();
+    for command in [
+        "c='rm -rf ~/code'; echo $($c)",
+        "c='rm -rf ~/code'; echo \"$($c)\"",
+        "c='rm -rf ~/code'; x=$($c)",
+        "c='rm -rf ~/code'; echo `$c`",
+        "f=-rf; echo $(rm $f ~/code)",
+    ] {
+        sandbox.assert_denies(command);
+    }
+    for command in [
+        "c=ls; git commit -F - <<EOF\n$($c)\nEOF",
+        "c=ls; echo $($c)",
+        "D=/tmp/x; git commit -F - <<EOF\n$(ls $D)\nEOF",
+        // A quoted delimiter keeps the body as data.
+        "c='rm -rf ~/code'; git commit -F - <<'EOF'\n$($c)\nEOF",
+        // The same body with no outer assignment is judged on its own text.
+        "git commit -F - <<EOF\n$(rm -rf /tmp/x)\nEOF",
+    ] {
+        sandbox.assert_allows(command);
     }
 }
 
@@ -570,9 +736,6 @@ fn reported_everyday_commands_stay_allowed() {
         format!("A={home}/code/app; git -C $A status --short"),
         "W=/tmp/w; f=form; git -C $W show HEAD:x/$f.ts".to_string(),
         "git -c $X show HEAD:x/$f.ts".to_string(),
-        format!(
-            "S={tmp}\npython3 - <<'PY'\nprint(\"x\")\nPY\n./deploy.sh validate > $S/validate.log 2>&1"
-        ),
         "LOG=/private/tmp/x.log; echo hi > $LOG".to_string(),
         format!("rm -rf {tmp}/scratch-root"),
         format!(

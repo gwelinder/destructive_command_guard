@@ -724,6 +724,11 @@ impl Pack {
                 .map(|_| false)
             }
             "core.filesystem" => {
+                // The literal-temp `find` regexes cannot see a symlink that
+                // leads out of temp; this refusal outranks them.
+                if crate::packs::core::filesystem::find_reaches_outside_literal_temp(cmd) {
+                    return Some(false);
+                }
                 // This proof owns unlink's exemptions, including rejected
                 // literal-path boundaries that a legacy temp regex may match.
                 crate::packs::core::filesystem::unlink_command_for_pattern_matching(

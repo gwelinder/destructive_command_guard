@@ -15709,21 +15709,38 @@ fn evaluate_command_substitutions(
             || source_start.is_some_and(|start| {
                 source_position_receives_automated_stdin(command, start, shell_dialect)
             });
-        let mut result = evaluate_command_with_pack_order_deadline_at_path_inner(
-            &body,
-            enabled_keywords,
-            ordered_packs,
-            keyword_index,
-            compiled_overrides,
-            allowlists,
-            heredoc_settings,
-            allow_once_audit,
-            project_path,
-            deadline,
-            candidate_dialect,
-            nested_command_depth + 1,
-            substitution_automated_stdin,
-        );
+        let evaluate_body = |text: &str| {
+            evaluate_command_with_pack_order_deadline_at_path_inner(
+                text,
+                enabled_keywords,
+                ordered_packs,
+                keyword_index,
+                compiled_overrides,
+                allowlists,
+                heredoc_settings,
+                allow_once_audit,
+                project_path,
+                deadline,
+                candidate_dialect,
+                nested_command_depth + 1,
+                substitution_automated_stdin,
+            )
+        };
+        let mut result = evaluate_body(&body);
+        // The body alone has lost the outer shell's variables. Judge it once
+        // more behind the outer literal assignments it reads; only a denial
+        // from that reading is kept, so it can never allow more.
+        if candidate_dialect == ShellDialect::Posix
+            && !result.is_denied()
+            && !nested_evaluation_incomplete(&result)
+            && let Some(bound_body) = source_start
+                .and_then(|start| outer_assignments_read_by_substitution(command, start, &body))
+        {
+            let bound = evaluate_body(&bound_body);
+            if bound.is_denied() || nested_evaluation_incomplete(&bound) {
+                result = bound;
+            }
+        }
         if nested_evaluation_incomplete(&result) {
             return Some(result);
         }
@@ -15751,6 +15768,72 @@ fn evaluate_command_substitutions(
         }
     }
     None
+}
+
+/// The body of the substitution at `offset` in `command`, behind the literal
+/// assignment-only statements of `command` that end before it, when the body
+/// reads a name one of them assigns.
+///
+/// A substitution body is evaluated as a command of its own, which loses the
+/// outer shell's variables: with `c='rm -rf ~/code'` set first, the body `$c`
+/// of `$($c)` was judged as an unknown command and allowed, in an unquoted
+/// heredoc body and in an argument alike, while `c='rm -rf ~/code'; $c` is
+/// denied. With the assignments in front, the executable-assignment model and
+/// the `$VAR` proofs resolve the body exactly as they resolve a direct use.
+///
+/// An assignment whose value holds a substitution is left out. The model does
+/// not resolve such a value, and repeating it would evaluate its body again at
+/// every nesting level.
+fn outer_assignments_read_by_substitution(
+    command: &str,
+    offset: usize,
+    body: &str,
+) -> Option<String> {
+    if !body.contains('$') {
+        return None;
+    }
+    let mut bound = String::new();
+    let mut reads_outer_name = false;
+    for (start, end) in top_level_segment_ranges(command) {
+        if end > offset {
+            break;
+        }
+        let Some(segment) = command.get(start..end) else {
+            continue;
+        };
+        if segment.contains("$(") || segment.contains('`') {
+            continue;
+        }
+        let names: Vec<&str> = if let Some((name, _)) = posix_executable_assignment_parts(segment) {
+            vec![name]
+        } else if let Some(parts) = posix_multiple_assignment_parts(segment) {
+            parts.into_iter().map(|(name, _)| name).collect()
+        } else {
+            continue;
+        };
+        reads_outer_name |= names
+            .iter()
+            .any(|name| shell_text_reads_variable(body, name));
+        bound.push_str(segment.trim());
+        bound.push('\n');
+    }
+    reads_outer_name.then(|| {
+        bound.push_str(body);
+        bound
+    })
+}
+
+/// Whether `text` expands the shell variable `name` as `$name` or `${name…}`.
+fn shell_text_reads_variable(text: &str, name: &str) -> bool {
+    text.match_indices('$').any(|(index, _)| {
+        let rest = &text[index + 1..];
+        let rest = rest.strip_prefix('{').unwrap_or(rest);
+        rest.strip_prefix(name).is_some_and(|after| {
+            !after.starts_with(|character: char| {
+                character.is_ascii_alphanumeric() || character == '_'
+            })
+        })
+    })
 }
 
 /// The ordinary matching view and the shell syntax custom policies may inspect
@@ -29505,7 +29588,11 @@ fn evaluate_packs_with_allowlists_at_depth(
             // Existing and unprovable targets stay denied.
             if pattern.name == Some("redirect-truncate-root-home")
                 && pack_id == "core.filesystem"
-                && redirect_targets_are_new_home_files(command_for_packs, shell_dialect)
+                && redirect_targets_are_new_home_files(
+                    command_for_packs,
+                    original_command,
+                    shell_dialect,
+                )
             {
                 continue;
             }
@@ -31645,6 +31732,15 @@ fn resolve_variable_bindings(
         } else {
             Vec::new()
         };
+    let redirect_mode = matches!(
+        mode,
+        VariableResolution::RedirectLiteral | VariableResolution::Redirect { .. }
+    );
+    let quoted_heredoc_bodies = if redirect_mode && !heredoc_bodies.is_empty() {
+        crate::heredoc::quoted_heredoc_bodies(source)
+    } else {
+        Vec::new()
+    };
     let mut values: Option<Vec<String>> = None;
     for &(start, end) in segment_ranges {
         if end > segment_start {
@@ -31781,6 +31877,17 @@ fn resolve_variable_bindings(
             // not a parent-shell wrapper. It cannot mutate another scalar.
             continue;
         }
+        // A line of a quoted heredoc body is data, not a statement: the shell
+        // expands none of it. Whether the reading command runs it in this
+        // shell (`source /dev/stdin <<'EOF'`, `read S <<'EOF'`) is decided on
+        // the operator's own statement, which precedes the body and stays in
+        // this scan.
+        if quoted_heredoc_bodies
+            .iter()
+            .any(|body| body.start <= start && end <= body.end)
+        {
+            continue;
+        }
         if segment_may_rebind_variable(source, segment, name, mode) {
             return None;
         }
@@ -31818,6 +31925,66 @@ fn resolve_variable_bindings(
         }
     }
     values
+}
+
+/// `segment` with the operator and delimiter word of each heredoc removed, when
+/// every `<<` in it opens a heredoc whose plain delimiter is quoted
+/// (`<<'EOF'`, `<<-"EOF"`, `<<\EOF`). `None` when it holds no `<<` or any other
+/// form: a here-string or an unquoted delimiter expands its text in this shell,
+/// a descriptor or `{NAME}` prefix (`3<<'EOF'`, `{S}<<'EOF'`) opens or assigns
+/// a descriptor, and `<<` inside a word (`$((1<<2))`) is not an operator.
+fn without_quoted_heredoc_operators(segment: &str) -> Option<String> {
+    let bytes = segment.as_bytes();
+    let mut statement = String::with_capacity(segment.len());
+    let mut copied = 0;
+    while let Some(found) = segment[copied..].find("<<") {
+        let operator = copied + found;
+        if operator > 0 && !bytes[operator - 1].is_ascii_whitespace() {
+            return None;
+        }
+        let mut cursor = operator + 2;
+        if bytes.get(cursor) == Some(&b'-') {
+            cursor += 1;
+        }
+        while matches!(bytes.get(cursor), Some(b' ' | b'\t')) {
+            cursor += 1;
+        }
+        let end = quoted_heredoc_delimiter_end(bytes, cursor)?;
+        if !bytes.get(end).is_none_or(|byte| {
+            byte.is_ascii_whitespace() || matches!(byte, b';' | b'|' | b'&' | b'<' | b'>' | b')')
+        }) {
+            return None;
+        }
+        statement.push_str(&segment[copied..operator]);
+        statement.push(' ');
+        copied = end;
+    }
+    if copied == 0 {
+        return None;
+    }
+    statement.push_str(&segment[copied..]);
+    Some(statement)
+}
+
+/// The end of a heredoc delimiter word at `start` that is quoted as a whole
+/// (`'EOF'`, `"EOF"`) or escaped (`\EOF`), with a plain name.
+fn quoted_heredoc_delimiter_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let quote = *bytes.get(start)?;
+    let name_start = start + 1;
+    let name_len = bytes
+        .get(name_start..)?
+        .iter()
+        .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        .count();
+    if name_len == 0 {
+        return None;
+    }
+    let name_end = name_start + name_len;
+    match quote {
+        b'\'' | b'"' => (bytes.get(name_end) == Some(&quote)).then_some(name_end + 1),
+        b'\\' => Some(name_end),
+        _ => None,
+    }
 }
 
 /// Accepting one binding must account for the other assignment words in its
@@ -31882,6 +32049,19 @@ fn segment_may_rebind_variable(
     name: &str,
     mode: VariableResolution,
 ) -> bool {
+    if matches!(
+        mode,
+        VariableResolution::RedirectLiteral | VariableResolution::Redirect { .. }
+    ) && let Some(statement) = without_quoted_heredoc_operators(segment)
+    {
+        // `cat <<'EOF'` expands nothing, and the binding scan skips the
+        // body's lines as data. Judge the statement the shell runs without
+        // the operator, so `read S <<'EOF'`, `<< 'EOF' read S` and
+        // `source /dev/stdin <<'EOF'` still refuse the proof. `exec <<'EOF'`
+        // makes the body this shell's own input, so it refuses as well.
+        return hazard_first_word(&statement) == "exec"
+            || segment_may_rebind_variable(source, &statement, name, mode);
+    }
     let first = hazard_first_word(segment);
     if !matches!(mode, VariableResolution::DenyOnlyLiteral)
         && (first.contains(['$', '`'])
@@ -34568,14 +34748,14 @@ struct LeadingMkdirDir {
 }
 
 /// Directories created by a chain of `mkdir [-p] <literal>... &&` segments at
-/// the very start of `command` (`mkdir ~/r/new && cmd > ~/r/new/out.log`).
+/// the very start of `command` (`mkdir ~/r/new && cmd > ~/r/new/out.log`),
+/// and the text that follows the chain.
 ///
 /// Only literal absolute or home-anchored operands qualify, so no expansion
 /// can change which directory is made. `&&` guarantees the rest of the command
 /// runs only after every directory exists. Any other option, a relative or
-/// dynamic operand, or a line break ends the chain: the remaining segments get
-/// no created-parent credit.
-fn leading_mkdir_created_dirs(command: &str, home: &Path) -> Vec<LeadingMkdirDir> {
+/// dynamic operand, or a line break ends the chain.
+fn leading_mkdir_chain<'a>(command: &'a str, home: &Path) -> (Vec<LeadingMkdirDir>, &'a str) {
     let mut created = Vec::new();
     let mut rest = command.trim_start_matches([' ', '\t']);
     while let Some(after) = rest
@@ -34600,7 +34780,7 @@ fn leading_mkdir_created_dirs(command: &str, home: &Path) -> Vec<LeadingMkdirDir
             }) {
                 paths.push(path);
             } else {
-                return created;
+                return (created, rest);
             }
         }
         if paths.is_empty() {
@@ -34613,7 +34793,51 @@ fn leading_mkdir_created_dirs(command: &str, home: &Path) -> Vec<LeadingMkdirDir
         );
         rest = tail.trim_start_matches([' ', '\t']);
     }
-    created
+    (created, rest)
+}
+
+/// Whether every `>` byte in `command` is an unquoted POSIX output-redirect
+/// operator of `command` itself. A `>` inside quotes, after an escape or in a
+/// comment can belong to a shell payload (`bash -c '…; echo > f'`) whose
+/// redirect opens only after its earlier commands ran.
+fn every_gt_is_an_outer_redirect(command: &str) -> bool {
+    let mut outer = 0usize;
+    let mut rest = command;
+    while let Some(index) = first_unquoted_output_redirect(rest, ShellDialect::Posix) {
+        outer += 1;
+        rest = &rest[index + 1..];
+    }
+    outer == command.matches('>').count()
+}
+
+/// The directories a leading `mkdir` chain in `command` creates, with the
+/// redirect targets of the one command that runs right after the chain.
+///
+/// The shell opens a simple command's redirects before it runs the command,
+/// so in `mkdir ~/r/new && node … > ~/r/new/out.log` the file is opened in a
+/// directory that is moments old and empty. Anything that can run between the
+/// `mkdir` and that open could plant a symlink to a real file there, so each
+/// of these withdraws the credit: a second segment (`mkdir D && ln -s ~/.zshrc
+/// D/x && echo > D/x`), a command or process substitution, which runs before
+/// the redirect opens (`echo $(ln -s ~/.zshrc D/x) > D/x`), a line break, and
+/// a `>` that is not an outer redirect of that command.
+fn mkdir_created_dirs_before_redirects(
+    command: &str,
+    home: &Path,
+) -> Option<(Vec<LeadingMkdirDir>, Vec<String>)> {
+    let (created, tail) = leading_mkdir_chain(command, home);
+    if created.is_empty()
+        || tail.contains(['\n', '\r', '`'])
+        || ["$(", "<(", ">("]
+            .iter()
+            .any(|opener| tail.contains(opener))
+        || command_segment_ranges(tail).len() != 1
+        || !every_gt_is_an_outer_redirect(tail)
+    {
+        return None;
+    }
+    let targets = unquoted_output_redirect_targets(tail, ShellDialect::Posix)?;
+    Some((created, targets))
 }
 
 /// Whether `target` is a new file in a directory that does not exist yet but
@@ -34678,18 +34902,35 @@ fn redirect_targets_are_new_home_files_with_home(
     dialect: ShellDialect,
     home: &Path,
 ) -> bool {
+    redirect_targets_are_new_home_files_in(command, command, dialect, home)
+}
+
+/// [`redirect_targets_are_new_home_files_with_home`] for `command`, a view of
+/// `whole_command` (the evaluator may hand over one segment). A leading
+/// `mkdir` chain is read from `whole_command`, because a per-segment view no
+/// longer shows it, and its credit covers only targets of the command right
+/// after the chain.
+fn redirect_targets_are_new_home_files_in(
+    command: &str,
+    whole_command: &str,
+    dialect: ShellDialect,
+    home: &Path,
+) -> bool {
     let Some(targets) = unquoted_output_redirect_targets(command, dialect) else {
         return false;
     };
-    let created = if dialect == ShellDialect::Posix {
-        leading_mkdir_created_dirs(command, home)
-    } else {
-        Vec::new()
-    };
+    let mkdir_credit = (dialect == ShellDialect::Posix)
+        .then(|| mkdir_created_dirs_before_redirects(whole_command, home))
+        .flatten();
     targets.into_iter().all(|raw| {
         literal_home_redirect_path(&raw, home).is_some_and(|target| {
             path_is_new_file_under_home(&target, home)
-                || path_is_new_file_in_created_home_dir(&target, home, &created)
+                || mkdir_credit
+                    .as_ref()
+                    .is_some_and(|(created, credited_targets)| {
+                        credited_targets.contains(&raw)
+                            && path_is_new_file_in_created_home_dir(&target, home, created)
+                    })
         })
     })
 }
@@ -34718,12 +34959,17 @@ fn redirect_targets_are_new_home_files_with_home(
 /// #337, it requires a concurrent writer racing the agent's own command, and
 /// it is exactly what `dcg create-new` exists for when exclusive creation must
 /// be guaranteed.
-fn redirect_targets_are_new_home_files(command: &str, dialect: ShellDialect) -> bool {
+fn redirect_targets_are_new_home_files(
+    command: &str,
+    whole_command: &str,
+    dialect: ShellDialect,
+) -> bool {
     if NonlocalFilesystemScope::active() {
         return false;
     }
-    crate::config::home_dir()
-        .is_some_and(|home| redirect_targets_are_new_home_files_with_home(command, dialect, &home))
+    crate::config::home_dir().is_some_and(|home| {
+        redirect_targets_are_new_home_files_in(command, whole_command, dialect, &home)
+    })
 }
 
 /// Apply the truncating-redirect policy to a PowerShell writer's bound file operand.
@@ -38004,7 +38250,11 @@ fn evaluate_pack_destructive_patterns(
                 continue;
             }
             if pattern.name == Some("redirect-truncate-root-home")
-                && redirect_targets_are_new_home_files(redirect_syntax_command, shell_dialect)
+                && redirect_targets_are_new_home_files(
+                    redirect_syntax_command,
+                    original_command,
+                    shell_dialect,
+                )
             {
                 continue;
             }

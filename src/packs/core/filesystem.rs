@@ -4222,8 +4222,15 @@ const LITERAL_TEMP_PREFIXES: [&str; 4] =
 fn path_is_safe_unquoted(path: &str) -> bool {
     split_literal_temp_prefix(path).is_some_and(|(prefix, suffix)| {
         temp_path_suffix_is_static_unquoted(suffix)
-            && temp_path_lands_in_temp(prefix, glob_free_directory(suffix))
+            && unquoted_temp_suffix_lands_in_temp(prefix, suffix)
     }) || windows_literal_user_temp_subpath(path)
+}
+
+/// Whether every path the unquoted temp suffix can name stays below the temp
+/// root it is spelled under. See [`glob_free_directory`] and
+/// [`temp_path_lands_in_temp`].
+fn unquoted_temp_suffix_lands_in_temp(prefix: &str, suffix: &str) -> bool {
+    glob_free_directory(suffix).is_some_and(|directory| temp_path_lands_in_temp(prefix, directory))
 }
 
 fn path_is_safe_double_quoted(path: &str) -> bool {
@@ -4244,12 +4251,51 @@ fn split_literal_temp_prefix(path: &str) -> Option<(&'static str, &str)> {
 
 /// The directory part of an unquoted temp suffix that names exactly one
 /// place: everything before the component holding the first glob character.
-fn glob_free_directory(suffix: &str) -> &str {
-    suffix.find(['*', '?', '[']).map_or(suffix, |glob| {
+///
+/// `None` when a `/` follows a glob. A glob can match a symlink, and the
+/// component after it is then reached through that link: `rm -rf /tmp/*/`
+/// and `rm -rf /tmp/*/code` follow `/tmp/x/link -> ~` into the home
+/// directory. A glob in the last component names entries of the checked
+/// directory itself, and `rm` removes a matched link without following it.
+fn glob_free_directory(suffix: &str) -> Option<&str> {
+    let Some(glob) = suffix.find(['*', '?', '[']) else {
+        return Some(suffix);
+    };
+    if suffix[glob..].contains('/') {
+        return None;
+    }
+    Some(
         suffix[..glob]
             .rsplit_once('/')
-            .map_or("", |(directory, _)| directory)
-    })
+            .map_or("", |(directory, _)| directory),
+    )
+}
+
+/// Whether `command` is a `find` that the literal-temp safe patterns
+/// (`find-delete-tmp`, `find-delete-var-tmp`, `find-exec-rm-tmp`) could
+/// allow, although it reaches outside the temp tree.
+///
+/// Those patterns read only the spelling. With `/tmp/x/link -> ~`,
+/// `find /tmp/x/link/ -delete` deletes the contents of the home directory,
+/// and `find /tmp/x/link/code -delete` deletes `~/code`. A start path must
+/// therefore pass the same symlink proof as an `rm` operand, and a
+/// link-following option (`-follow`, `-L`, `-H`) refuses the command, since
+/// any link inside the tree would then be followed.
+pub(crate) fn find_reaches_outside_literal_temp(command: &str) -> bool {
+    let mut words = command.split_ascii_whitespace();
+    if words.next() != Some("find") {
+        return false;
+    }
+    let words: Vec<&str> = words.collect();
+    words
+        .iter()
+        .any(|word| matches!(*word, "-follow" | "-L" | "-H"))
+        || words
+            .iter()
+            .copied()
+            .take_while(|word| !word.starts_with('-') || *word == "--")
+            .filter_map(split_literal_temp_prefix)
+            .any(|(prefix, suffix)| !unquoted_temp_suffix_lands_in_temp(prefix, suffix))
 }
 
 /// The text of a static double-quoted word after the shell removes the
