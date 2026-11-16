@@ -1,0 +1,55 @@
+# Fork-only workflow: build the macOS arm64 release binary and run the full
+# test suite on GitHub's runner, so the fork owner can install a tested binary
+# without building on a disk-constrained Mac. Not intended for upstream.
+name: fork-macos-build
+
+on:
+  push:
+    branches: ['fix/frog-triage-20261116']
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-and-test:
+    runs-on: macos-15
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install the toolchain pinned in rust-toolchain.toml
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal --component rustfmt,clippy
+          rustc --version
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Cache cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-fork-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Upload release binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: dcg-aarch64-apple-darwin-${{ github.sha }}
+          path: target/release/dcg
+          retention-days: 14
+
+      - name: Run the full test suite
+        run: cargo nextest run --profile ci --no-fail-fast
+
+      - name: Run doc tests
+        run: cargo test --doc
