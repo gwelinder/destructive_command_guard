@@ -7,8 +7,9 @@
 //! `.` or `..` component, and its real location after following every
 //! symlink is one of:
 //!
-//! - below a temp root (`/tmp`, `/var/tmp`, their macOS `/private` forms, or
-//!   the startup `TMPDIR`), never the root itself;
+//! - below a temp root (`/tmp`, `/var/tmp`, their macOS `/private` forms, the
+//!   startup `TMPDIR`, or the macOS per-user temp directory `TMPDIR` names),
+//!   never the root itself;
 //! - below `~/Library/Caches`, never the cache root itself;
 //! - a build-output directory (`node_modules`, `dist`, `.next`, `coverage`,
 //!   `target`, `build`) that is a real directory without `.git`, sits next to
@@ -120,19 +121,24 @@ pub(crate) struct ReclaimRoots {
 
 impl ReclaimRoots {
     /// The caller's home directory plus `/tmp`, `/var/tmp`, their `/private`
-    /// forms and the startup `TMPDIR`. `None` without a usable home, and
-    /// while [`ReclaimSuspended`] is in force.
+    /// forms, the startup `TMPDIR` and the macOS per-user temp directory.
+    /// `None` without a usable home, and while [`ReclaimSuspended`] is in
+    /// force.
     #[must_use]
     pub(crate) fn current() -> Option<Self> {
         if SUSPENDED.with(std::cell::Cell::get) {
             return None;
         }
         let home = crate::config::home_dir()?;
+        let per_user = std::env::var_os("TMPDIR")
+            .map(|tmpdir| per_user_temp_roots(&tmpdir, &home))
+            .unwrap_or_default();
         let temp_roots = TEMP_ROOTS
             .iter()
             .copied()
             .chain(crate::evaluator::startup_tmpdir_root())
             .map(PathBuf::from)
+            .chain(per_user)
             .collect();
         Some(Self { home, temp_roots })
     }
@@ -249,6 +255,62 @@ impl ReclaimRoots {
         }
         true
     }
+}
+
+/// The macOS per-user temp directory, when `tmpdir` names it.
+///
+/// macOS gives each user a private `/var/folders/<a>/<b>/T` and exports it as
+/// `TMPDIR`; `mktemp -d` and most tools put their scratch there. The startup
+/// `TMPDIR` check refuses it, because `/var` is a protected system tree in
+/// general, so only this exact shape is accepted here: it must resolve to
+/// `/private/var/folders/<a>/<b>/T`, be a directory, and belong to the owner
+/// of the home directory. Both spellings are returned so a target written
+/// either way matches.
+fn per_user_temp_roots(tmpdir: &std::ffi::OsStr, home: &Path) -> Vec<PathBuf> {
+    use std::path::Component;
+
+    let spelled = Path::new(tmpdir);
+    let mut components = spelled.components();
+    if components.next() != Some(Component::RootDir) {
+        return Vec::new();
+    }
+    let Some(names) = components
+        .map(|component| match component {
+            Component::Normal(name) => name.to_str(),
+            _ => None,
+        })
+        .collect::<Option<Vec<&str>>>()
+    else {
+        return Vec::new();
+    };
+    let tail = names.strip_prefix(&["private"]).unwrap_or(names.as_slice());
+    let ["var", "folders", bucket, user, "T"] = tail else {
+        return Vec::new();
+    };
+    let short = Path::new("/var/folders").join(bucket).join(user).join("T");
+    let real = Path::new("/private/var/folders")
+        .join(bucket)
+        .join(user)
+        .join("T");
+    let owned_by_home_owner = std::fs::metadata(&real)
+        .ok()
+        .zip(std::fs::metadata(home).ok())
+        .is_some_and(|(temp, home)| temp.is_dir() && same_owner(&temp, &home));
+    if !owned_by_home_owner || std::fs::canonicalize(spelled).ok().as_ref() != Some(&real) {
+        return Vec::new();
+    }
+    vec![short, real]
+}
+
+#[cfg(unix)]
+fn same_owner(first: &std::fs::Metadata, second: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    first.uid() == second.uid()
+}
+
+#[cfg(not(unix))]
+fn same_owner(_first: &std::fs::Metadata, _second: &std::fs::Metadata) -> bool {
+    false
 }
 
 /// `path` is spelled below `root`, is not `root` itself, and lands there.
@@ -527,5 +589,49 @@ mod tests {
         ] {
             assert!(!allowed(&refused), "{refused}");
         }
+    }
+
+    #[test]
+    fn only_the_exact_per_user_temp_shape_names_a_temp_root() {
+        let home = tempfile::tempdir().expect("home");
+        for spelled in [
+            "/var/folders/ab/cd/C",
+            "/var/folders/ab/T",
+            "/var/folders/ab/cd/T/x",
+            "/var/folders/ab/../cd/T",
+            "var/folders/ab/cd/T",
+            "/tmp/var/folders/ab/cd/T",
+            "/var/tmp",
+            "/",
+            "",
+        ] {
+            assert!(
+                per_user_temp_roots(std::ffi::OsStr::new(spelled), home.path()).is_empty(),
+                "{spelled}"
+            );
+        }
+    }
+
+    /// On macOS the real `TMPDIR` is the per-user directory, so the shape
+    /// check meets real directories: the directory itself qualifies in both
+    /// spellings, while its existing siblings and traversal spellings do not.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_real_per_user_temp_directory_is_a_temp_root() {
+        let tmpdir = std::env::var_os("TMPDIR").expect("macOS exports TMPDIR");
+        let home = std::env::var_os("HOME").expect("HOME");
+        let home = Path::new(&home);
+        let roots = per_user_temp_roots(&tmpdir, home);
+        let real = std::fs::canonicalize(&tmpdir).expect("TMPDIR resolves");
+        assert!(roots.contains(&real), "{roots:?}");
+        assert!(
+            roots.iter().any(|root| root.starts_with("/var/folders")),
+            "{roots:?}"
+        );
+        let bucket = real.parent().expect("per-user bucket");
+        let cache = bucket.join("C");
+        assert!(per_user_temp_roots(cache.as_os_str(), home).is_empty());
+        let traversal = bucket.join("T/../T");
+        assert!(per_user_temp_roots(traversal.as_os_str(), home).is_empty());
     }
 }
