@@ -830,6 +830,12 @@ fn package_runner_command_index(
         if option == "--" {
             return Ok(index + 1);
         }
+        if runner == PackageRunner::Bun && bun_option_supplies_inline_source(option) {
+            // `bun -e|--eval|-p|--print <code>` runs the inline source. Every
+            // later word is that program's argv, never a script or package
+            // to resolve, so an expansion there cannot name Wrangler.
+            return Err(WranglerExecutableDecision::NoMatch);
+        }
         if package_runner_attached_option(runner, option) {
             index += 1;
             continue;
@@ -856,6 +862,12 @@ fn package_runner_command_index(
         return Ok(index);
     }
     Err(WranglerExecutableDecision::NoMatch)
+}
+
+fn bun_option_supplies_inline_source(option: &str) -> bool {
+    matches!(option, "-e" | "--eval" | "-p" | "--print")
+        || option.starts_with("--eval=")
+        || option.starts_with("--print=")
 }
 
 fn runner_package_decision(package: &str, index: usize) -> WranglerExecutableDecision {
@@ -967,11 +979,33 @@ fn runtime_script_candidate_decision(
     // no decoded fragment can prove that a dynamic script path is unrelated.
     // Keep the fail-closed decision narrowly gated by destructive Wrangler
     // argv; `$SCRIPT --version` remains an irrelevant safe control.
-    if trailing_argv_is_destructive_wrangler_shape(words, index + 1, dialect) {
+    //
+    // Without any literal Wrangler text in the script word or its argv, an
+    // unbounded argv word names nothing and may not supply the `delete` /
+    // `rollback` evidence (#281): `node $(ls probe.mjs) $PWD` runs an
+    // unknown script with unknown arguments, not Wrangler. A literal
+    // destructive argv (`node $S delete worker`) still fails closed.
+    let destructive_argv = if runtime_candidate_carries_wrangler_text(words, index) {
+        trailing_argv_is_destructive_wrangler_shape(words, index + 1, dialect)
+    } else {
+        unbounded_executable_argv_is_destructive_wrangler_shape(words, index + 1, dialect)
+    };
+    if destructive_argv {
         WranglerExecutableDecision::Unverified
     } else {
         WranglerExecutableDecision::NoMatch
     }
+}
+
+/// Whether the script word or any later word spells `wrangler` in its decoded
+/// literal text (`$DIR/wrangler.js`, `wr''angler`, `--config wrangler.toml`).
+fn runtime_candidate_carries_wrangler_text(words: &[WranglerWord], index: usize) -> bool {
+    words[index.min(words.len())..].iter().any(|word| {
+        word.decoded
+            .as_bytes()
+            .windows("wrangler".len())
+            .any(|window| window.eq_ignore_ascii_case(b"wrangler"))
+    })
 }
 
 fn node_wrangler_script_index(
@@ -1952,6 +1986,33 @@ fn wrangler_segment_semantic_decision(
 /// POSIX quote/escape concatenation without reinterpreting dynamic expansion.
 #[must_use]
 pub(crate) fn wrangler_semantic_decision_in_dialect(
+    command: &str,
+    dialect: ShellDialect,
+) -> WranglerSemanticDecision {
+    let decision = wrangler_semantic_decision_for_view(command, dialect);
+    if decision != WranglerSemanticDecision::Unverified
+        || dialect != ShellDialect::Posix
+        || !command.contains("<<")
+    {
+        return decision;
+    }
+    // A quoted heredoc body that is data (`cat > f <<'EOF'`) or the program
+    // of a proven non-shell interpreter (`python3 - <<'EOF'`) is not shell
+    // syntax. Its `;` and `${…}` split it into dozens of undecodable
+    // "segments", which tripped the segment bound and denied scripts that
+    // never mention Wrangler. Judge the outer shell syntax with those bodies
+    // blanked; the masks keep byte offsets, and the raw pattern scan and the
+    // language analysis still read the bodies. Only an `Unverified` answer is
+    // re-examined, so ordinary commands pay nothing for the masks.
+    let data_view = crate::heredoc::mask_non_expanding_data_heredocs(command);
+    let shell_view = crate::heredoc::mask_inert_interpreter_stdin(data_view.as_ref());
+    if shell_view.as_ref() == command {
+        return decision;
+    }
+    wrangler_semantic_decision_for_view(shell_view.as_ref(), dialect)
+}
+
+fn wrangler_semantic_decision_for_view(
     command: &str,
     dialect: ShellDialect,
 ) -> WranglerSemanticDecision {
