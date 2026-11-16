@@ -2072,10 +2072,12 @@ pub fn extract_content(command: &str, limits: &ExtractionLimits) -> ExtractionRe
     // not shell syntax either: `bash -c "$(cat run.sh)"` quoted in a Python
     // docstring or comment is text, and mining it as an inline script denied
     // the command as an unverifiable launcher. Hide those bodies from the
-    // inline-script miner only; heredoc extraction below still reads the raw
-    // command, so the body keeps its language analysis and raw pattern scan.
-    let scan_view = mask_inert_interpreter_stdin(data_view.as_ref());
-    let result = extract_content_with_scan_view(command, scan_view.as_ref(), limits);
+    // inline-script miners only. Heredoc extraction keeps the data view: a
+    // heredoc nested in such a program (Perl `eval <<'CODE'`) is still code
+    // the program runs, and the body itself keeps its language analysis.
+    let inline_view = mask_inert_interpreter_stdin(data_view.as_ref());
+    let result =
+        extract_content_with_views(command, inline_view.as_ref(), data_view.as_ref(), limits);
     remember_completed_extraction(command, limits, &result);
     result
 }
@@ -2161,6 +2163,19 @@ fn extract_content_with_scan_view(
     scan_view: &str,
     limits: &ExtractionLimits,
 ) -> ExtractionResult {
+    extract_content_with_views(command, scan_view, scan_view, limits)
+}
+
+/// [`extract_content_with_scan_view`] with separate views for the
+/// inline-script miners (`inline_view`) and for the check that skips heredocs
+/// written inside data bodies (`heredoc_view`). Both views are length
+/// preserving masks of `command`.
+fn extract_content_with_views(
+    command: &str,
+    inline_view: &str,
+    heredoc_view: &str,
+    limits: &ExtractionLimits,
+) -> ExtractionResult {
     let _phase = crate::perf::phase(crate::perf::ProfilePhase::HeredocExtract);
     let start_time = Instant::now();
     let timeout = Duration::from_millis(limits.timeout_ms);
@@ -2195,12 +2210,12 @@ fn extract_content_with_scan_view(
     }
 
     // Extract inline scripts (-c/-e flags). These and the six extractors after
-    // them read the scan view, so a payload quoted inside a data heredoc's body
+    // them read `inline_view`, so a payload quoted inside a data heredoc's body
     // is not mined out of it as a live invocation (#420). The heredoc and
     // here-string extractors below keep the raw command: their whole job is to
     // find those bodies.
     extract_inline_scripts(
-        scan_view,
+        inline_view,
         limits,
         start_time,
         timeout,
@@ -2220,7 +2235,7 @@ fn extract_content_with_scan_view(
 
     // Extract Windows inline wrappers (cmd /c|/k, iex/Invoke-Expression, -EncodedCommand)
     extract_windows_inline_scripts(
-        scan_view,
+        inline_view,
         limits,
         start_time,
         timeout,
@@ -2240,7 +2255,7 @@ fn extract_content_with_scan_view(
 
     // Extract `mise exec -c/--command` inline shell payloads (#259)
     extract_mise_inline_scripts(
-        scan_view,
+        inline_view,
         limits,
         start_time,
         timeout,
@@ -2260,7 +2275,7 @@ fn extract_content_with_scan_view(
 
     // Extract `bun exec <payload>` inline shell payloads (#397)
     extract_bun_exec_inline_scripts(
-        scan_view,
+        inline_view,
         limits,
         start_time,
         timeout,
@@ -2269,7 +2284,7 @@ fn extract_content_with_scan_view(
     );
     // Extract `deno eval <code>` inline JavaScript/TypeScript payloads
     extract_deno_eval_inline_scripts(
-        scan_view,
+        inline_view,
         limits,
         start_time,
         timeout,
@@ -2289,7 +2304,7 @@ fn extract_content_with_scan_view(
 
     // Extract awk `system()` / command-pipe shell payloads (#399)
     extract_awk_inline_scripts(
-        scan_view,
+        inline_view,
         limits,
         start_time,
         timeout,
@@ -2309,7 +2324,7 @@ fn extract_content_with_scan_view(
 
     // Extract `osascript -e 'do shell script "…"'` payloads (#398)
     extract_osascript_inline_scripts(
-        scan_view,
+        inline_view,
         limits,
         start_time,
         timeout,
@@ -2329,7 +2344,7 @@ fn extract_content_with_scan_view(
 
     // Extract `ssh … destination <command…>` remote payloads (#326)
     extract_ssh_inline_scripts(
-        scan_view,
+        inline_view,
         limits,
         start_time,
         timeout,
@@ -2349,7 +2364,7 @@ fn extract_content_with_scan_view(
 
     // `watch '<cmd>'`, `parallel ::: '<cmd>'`, `env -S'<cmd>'`
     extract_command_string_runner_scripts(
-        scan_view,
+        inline_view,
         limits,
         start_time,
         timeout,
@@ -2358,7 +2373,7 @@ fn extract_content_with_scan_view(
     );
     // `xargs git-reset --hard`, `find . '-delete'`
     extract_respelled_commands(
-        scan_view,
+        inline_view,
         limits,
         start_time,
         timeout,
@@ -2399,7 +2414,7 @@ fn extract_content_with_scan_view(
     // Extract heredocs (<<, <<-, <<~)
     extract_heredocs(
         command,
-        scan_view,
+        heredoc_view,
         limits,
         start_time,
         timeout,
