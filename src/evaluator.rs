@@ -30618,7 +30618,16 @@ fn proven_variable_redirect_offsets(
     {
         return None;
     }
-    let redirects = posix_output_redirects_for_proof(segment, false)?;
+    // `cat > "$S/notes.md" <<'EOF'` feeds a quoted body that expands nothing;
+    // read the statement's redirects with the heredoc operator blanked. The
+    // blanking keeps every offset, so the operators returned stay exact.
+    let without_heredocs;
+    let redirects = if let Some(redirects) = posix_output_redirects_for_proof(segment, false) {
+        redirects
+    } else {
+        without_heredocs = without_quoted_heredoc_operators(segment)?;
+        posix_output_redirects_for_proof(&without_heredocs, false)?
+    };
     let mut proved_dynamic_target = false;
     for redirect in &redirects {
         if redirect.append || redirect.fd_duplication {
@@ -31927,18 +31936,21 @@ fn resolve_variable_bindings(
     values
 }
 
-/// `segment` with the operator and delimiter word of each heredoc removed, when
-/// every `<<` in it opens a heredoc whose plain delimiter is quoted
-/// (`<<'EOF'`, `<<-"EOF"`, `<<\EOF`). `None` when it holds no `<<` or any other
-/// form: a here-string or an unquoted delimiter expands its text in this shell,
-/// a descriptor or `{NAME}` prefix (`3<<'EOF'`, `{S}<<'EOF'`) opens or assigns
-/// a descriptor, and `<<` inside a word (`$((1<<2))`) is not an operator.
+/// `segment` with the operator and delimiter word of each heredoc blanked to
+/// spaces (offsets stay valid), when every `<<` in it opens a heredoc whose
+/// plain delimiter is quoted (`<<'EOF'`, `<<-"EOF"`, `<<\EOF`) and the
+/// statement does not run `exec`, which would make the body this shell's own
+/// input. `None` when it holds no `<<` or any other form: a here-string or an
+/// unquoted delimiter expands its text in this shell, a descriptor or `{NAME}`
+/// prefix (`3<<'EOF'`, `{S}<<'EOF'`) opens or assigns a descriptor, and `<<`
+/// inside a word (`$((1<<2))`) is not an operator.
 fn without_quoted_heredoc_operators(segment: &str) -> Option<String> {
     let bytes = segment.as_bytes();
-    let mut statement = String::with_capacity(segment.len());
-    let mut copied = 0;
-    while let Some(found) = segment[copied..].find("<<") {
-        let operator = copied + found;
+    let mut blanked = bytes.to_vec();
+    let mut index = 0;
+    let mut found_operator = false;
+    while let Some(found) = segment[index..].find("<<") {
+        let operator = index + found;
         if operator > 0 && !bytes[operator - 1].is_ascii_whitespace() {
             return None;
         }
@@ -31955,15 +31967,18 @@ fn without_quoted_heredoc_operators(segment: &str) -> Option<String> {
         }) {
             return None;
         }
-        statement.push_str(&segment[copied..operator]);
-        statement.push(' ');
-        copied = end;
+        blanked[operator..end].fill(b' ');
+        index = end;
+        found_operator = true;
     }
-    if copied == 0 {
+    if !found_operator {
         return None;
     }
-    statement.push_str(&segment[copied..]);
-    Some(statement)
+    let statement = String::from_utf8(blanked).ok()?;
+    let runs_exec = statement
+        .split_ascii_whitespace()
+        .any(|word| dequoted_command_word(word) == "exec");
+    (!runs_exec).then_some(statement)
 }
 
 /// The end of a heredoc delimiter word at `start` that is quoted as a whole
@@ -32057,10 +32072,8 @@ fn segment_may_rebind_variable(
         // `cat <<'EOF'` expands nothing, and the binding scan skips the
         // body's lines as data. Judge the statement the shell runs without
         // the operator, so `read S <<'EOF'`, `<< 'EOF' read S` and
-        // `source /dev/stdin <<'EOF'` still refuse the proof. `exec <<'EOF'`
-        // makes the body this shell's own input, so it refuses as well.
-        return hazard_first_word(&statement) == "exec"
-            || segment_may_rebind_variable(source, &statement, name, mode);
+        // `source /dev/stdin <<'EOF'` still refuse the proof.
+        return segment_may_rebind_variable(source, &statement, name, mode);
     }
     let first = hazard_first_word(segment);
     if !matches!(mode, VariableResolution::DenyOnlyLiteral)

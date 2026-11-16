@@ -205,11 +205,13 @@ fn a_variable_redirect_to_an_existing_escaping_or_unset_target_stays_denied() {
 }
 
 /// A heredoc whose delimiter is quoted expands nothing, so feeding one to a
-/// command between a literal binding and its use leaves the binding intact,
-/// and the body's lines are data. The statement around the operator still
-/// counts: a command that reads the body into this shell, `exec` making the
-/// body the shell's input, a descriptor prefix, a here-string, an expanding
-/// heredoc and a later assignment all keep the dynamic-path denial.
+/// command between a literal binding and its use, or to the redirecting
+/// command itself, leaves the binding intact, and the body's lines are data.
+/// The statement around the operator still counts: a command that reads the
+/// body into this shell, `exec` making the body the shell's input, a
+/// descriptor prefix, a here-string, an expanding heredoc and a later
+/// assignment all keep the dynamic-path denial, and a proven home target
+/// keeps its own rule.
 #[test]
 fn a_quoted_heredoc_between_binding_and_use_keeps_the_binding() {
     let sandbox = Sandbox::new();
@@ -219,6 +221,8 @@ fn a_quoted_heredoc_between_binding_and_use_keeps_the_binding() {
         format!(
             "S={tmp}\npython3 - <<'PY'\nprint(\"x\")\nPY\n./deploy.sh validate > $S/validate.log 2>&1"
         ),
+        format!("S={tmp}; cat > $S/notes.md <<'EOF'\nhello\nEOF"),
+        format!("S={tmp} && cat > \"$S/run.sh\" <<\\EOF\necho hi\nEOF"),
         format!("S={tmp}\ncat <<\"EOF\"\nS={home}\nEOF\n./deploy.sh validate > $S/validate.log"),
         format!("S={tmp}\nnode <<\\EOF\nconst bits = 1 << 2;\nEOF\nnode run.mjs > $S/out.log"),
         format!(
@@ -246,6 +250,9 @@ fn a_quoted_heredoc_between_binding_and_use_keeps_the_binding() {
         format!("S={tmp}\ncat <<EOF\n$((S=0))\nEOF\ncat notes.md > $S/.zshrc"),
         format!("S={tmp}\ncat <<<\"$((S=0))\"\ncat notes.md > $S/.zshrc"),
         format!("S={tmp}\ncat <<'EOF'\nx\nEOF\nS={home}\ncat notes.md > $S/.zshrc"),
+        format!("S={tmp}; cat {{S}}<<'EOF' > $S/.zshrc\nx\nEOF"),
+        format!("S={tmp}; cat <<EOF > $S/.zshrc\n$((S=0))\nEOF"),
+        format!("S={home}; cat > $S/.zshrc <<'EOF'\nx\nEOF"),
     ] {
         sandbox.assert_denies(&command);
     }
