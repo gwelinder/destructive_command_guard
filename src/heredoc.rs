@@ -2067,7 +2067,14 @@ pub fn extract_content(command: &str, limits: &ExtractionLimits) -> ExtractionRe
     }
     #[cfg(test)]
     EXTRACTIONS_RUN.with(|count| count.set(count.get() + 1));
-    let scan_view = mask_non_expanding_data_heredocs(command);
+    let data_view = mask_non_expanding_data_heredocs(command);
+    // The program of a proven non-shell interpreter (`python3 - <<'EOF'`) is
+    // not shell syntax either: `bash -c "$(cat run.sh)"` quoted in a Python
+    // docstring or comment is text, and mining it as an inline script denied
+    // the command as an unverifiable launcher. Hide those bodies from the
+    // inline-script miner only; heredoc extraction below still reads the raw
+    // command, so the body keeps its language analysis and raw pattern scan.
+    let scan_view = mask_inert_interpreter_stdin(data_view.as_ref());
     let result = extract_content_with_scan_view(command, scan_view.as_ref(), limits);
     remember_completed_extraction(command, limits, &result);
     result
@@ -10656,10 +10663,37 @@ const PYTHON_RUN_MODE_FLAGS: &[u8] = b"bBdEIOPqRsSuv";
 /// `process.argv`: they can no longer become options, a script file or a code
 /// string. Anything else (a script operand, `-c`, `-m`, `-r`, an unknown
 /// option) does not prove that stdin is the program.
+/// Node options that change neither where the program comes from nor what
+/// else is loaded with it.
+const NODE_SOURCE_NEUTRAL_OPTIONS: &[&str] = &[
+    "--input-type=module",
+    "--input-type=commonjs",
+    "--input-type=module-typescript",
+    "--input-type=commonjs-typescript",
+    "--experimental-strip-types",
+    "--no-experimental-strip-types",
+    "--no-warnings",
+    "--no-deprecation",
+    "--enable-source-maps",
+];
+
 fn interpreter_arguments_read_program_from_stdin(program: &str, arguments: &[String]) -> bool {
     let name = program.rsplit('/').next().unwrap_or(program);
     let python = ScriptLanguage::from_command(name) == ScriptLanguage::Python;
+    let node = matches!(name, "node" | "nodejs");
     let mut rest = arguments;
+    if node {
+        // Options that only choose how Node parses or reports the program
+        // leave stdin the program: `node --input-type=module <<'EOF'` runs
+        // the body exactly as `node <<'EOF'` does. Anything that loads other
+        // code or supplies the program (`-e`, `-r`, `--import`) ends the scan.
+        while let Some((option, tail)) = rest.split_first() {
+            if !NODE_SOURCE_NEUTRAL_OPTIONS.contains(&option.as_str()) {
+                break;
+            }
+            rest = tail;
+        }
+    }
     if python {
         while let Some((option, tail)) = rest.split_first() {
             let Some(letters) = option.strip_prefix('-') else {
