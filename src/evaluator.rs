@@ -29510,6 +29510,12 @@ fn evaluate_packs_with_allowlists_at_depth(
                 continue;
             }
 
+            if find_delete_is_reclaimable(pack_id, pattern.name, original_command)
+                || mv_is_same_directory_rename(pack_id, pattern.name, original_command)
+            {
+                continue;
+            }
+
             // The rule matched a real redirect operator. Its target is now
             // known, so apply the rule-scoped target exemption (#284). Only
             // this rule stands down; every other pattern still sees the whole
@@ -30674,9 +30680,29 @@ fn statically_safe_redirect_target(
             return false;
         }
         let path = format!("{prefix}{value}{suffix}");
-        (!requires_tmp_root || redirect_path_has_tmp_root(&path))
-            && resolved_redirect_target_is_benign(&path)
+        ((!requires_tmp_root || redirect_path_has_tmp_root(&path))
+            && resolved_redirect_target_is_benign(&path))
+            || resolved_redirect_target_is_new_home_file(&path)
     })
+}
+
+/// A proven value that names a currently absent file under the home
+/// directory gets the verdict its literal spelling gets (#390): creating the
+/// file truncates nothing. `root=~/r; out="$root/new.md"; cmd > "$out"` is
+/// the same write as `cmd > ~/r/new.md`. Existing files, symlinks, missing
+/// parents, `.git` internals, protected credential files and any `.`/`..`
+/// component keep the dynamic-path denial.
+fn resolved_redirect_target_is_new_home_file(path: &str) -> bool {
+    if !path.starts_with('/')
+        || path
+            .split('/')
+            .any(|component| matches!(component, "." | ".."))
+        || crate::packs::core::credential_files::names_protected_file(&shell_words::quote(path))
+    {
+        return false;
+    }
+    crate::config::home_dir()
+        .is_some_and(|home| path_is_new_file_under_home(Path::new(path), &home))
 }
 
 /// Bound both recursive assignment copies and the bytes a proof may expand.
@@ -30967,6 +30993,12 @@ fn startup_tmpdir_root_is_unprotected(root: &Path) -> bool {
     !pattern
         .regex
         .is_match(&format!(": > {}", shell_words::quote(&target)))
+}
+
+/// The startup `TMPDIR`, when it passed the checks above. The reclaim policy
+/// trusts it as a temp root for deletions, exactly as redirects do.
+pub(crate) fn startup_tmpdir_root() -> Option<&'static str> {
+    STARTUP_TMPDIR_REDIRECT_ROOT.as_deref()
 }
 
 fn redirect_path_is_under_startup_tmpdir(path: &str) -> bool {
@@ -33253,6 +33285,8 @@ fn rm_segment_resolves_to_allowed_literals(
     ) else {
         return false;
     };
+    // Reclaim targets must be spelled literally; a spliced value is not.
+    let _literal_reclaim_only = crate::reclaim::ReclaimSuspended::enter();
     matches!(
         crate::packs::core::filesystem::parse_rm_command_segment_in_dialect(
             &resolved,
@@ -33300,6 +33334,8 @@ fn rm_segment_resolves_to_denied_literals(
         segment,
         ResolutionDirection::DenyOnly,
     )?;
+    // Reclaim targets must be spelled literally; a spliced value is not.
+    let _literal_reclaim_only = crate::reclaim::ReclaimSuspended::enter();
     match crate::packs::core::filesystem::parse_rm_command_segment_in_dialect(
         &resolved,
         automated_stdin,
@@ -33336,6 +33372,8 @@ fn rm_segment_denied_in_proven_directory(
         stripped_prefix,
         dialect,
     )?;
+    // The anchored operands were never spelled as absolute paths.
+    let _literal_reclaim_only = crate::reclaim::ReclaimSuspended::enter();
     let judge =
         |text: &str| match crate::packs::core::filesystem::parse_rm_command_segment_in_dialect(
             text,
@@ -33383,6 +33421,8 @@ fn rm_segment_denied_after_literal_substitution(
     if view.has_dynamic || view.command == segment {
         return None;
     }
+    // Rendered substitutions are not literal operands.
+    let _literal_reclaim_only = crate::reclaim::ReclaimSuspended::enter();
     match crate::packs::core::filesystem::parse_rm_command_segment_in_dialect(
         &view.command,
         automated_stdin,
@@ -34245,9 +34285,26 @@ fn unquoted_output_redirect_targets(command: &str, dialect: ShellDialect) -> Opt
             rest = &dup[digits..];
             continue;
         }
+        // A `)` with no `(` before it in the word closes an enclosing subshell
+        // or group (`(umask 077; : > ~/new.json)`): the shell ends the target
+        // word there. A balanced `(…)` stays in the token, where the literal
+        // check refuses it as glob syntax.
+        let mut open_parens = 0usize;
         let end = trimmed
-            .find(|c: char| c.is_ascii_whitespace() || matches!(c, ';' | '|' | '&' | '<' | '>'))
-            .unwrap_or(trimmed.len());
+            .char_indices()
+            .find(|&(_, c)| match c {
+                '(' => {
+                    open_parens += 1;
+                    false
+                }
+                ')' if open_parens == 0 => true,
+                ')' => {
+                    open_parens -= 1;
+                    false
+                }
+                _ => c.is_ascii_whitespace() || matches!(c, ';' | '|' | '&' | '<' | '>'),
+            })
+            .map_or(trimmed.len(), |(index, _)| index);
         let token = &trimmed[..end];
         if token.is_empty() {
             return None;
@@ -34413,6 +34470,209 @@ fn path_is_new_file_under_home(target: &Path, home: &Path) -> bool {
     parent.starts_with(&canonical_home)
 }
 
+/// Whether a `find-delete-*` match is a lone `find <paths> … -delete` that
+/// removes only temp output, updater caches or project build output
+/// ([`crate::reclaim`]). The whole original command must be that one
+/// invocation, so no other segment can ride along on the carve-out.
+fn find_delete_is_reclaimable(
+    pack_id: &str,
+    pattern_name: Option<&str>,
+    original_command: &str,
+) -> bool {
+    pack_id == "core.filesystem"
+        && matches!(
+            pattern_name,
+            Some("find-delete-root-home" | "find-delete-general")
+        )
+        && crate::reclaim::ReclaimRoots::current()
+            .is_some_and(|roots| roots.find_delete_command_is_reclaimable(original_command))
+}
+
+/// Whether an `mv-sensitive-source-root-home` match is a lone
+/// `mv [-n|-v|-i] <src> <dst>` that renames an existing entry to a currently
+/// absent name in the same directory below home.
+///
+/// The data stays where it was under another name, so nothing is destroyed,
+/// and the relocate-then-delete bypass the rule guards against does not
+/// apply: a later delete of the new name meets the same rm rules as the old
+/// name would. The destination must not exist (not even as a symlink), so
+/// nothing is overwritten. The directory must lie at least one level below
+/// home and resolve there, so a top-level home entry or a whole dotfile tree
+/// is never renamed. `.git` internals and credential files keep the deny.
+fn mv_is_same_directory_rename(
+    pack_id: &str,
+    pattern_name: Option<&str>,
+    original_command: &str,
+) -> bool {
+    if pack_id != "core.filesystem"
+        || pattern_name != Some("mv-sensitive-source-root-home")
+        || NonlocalFilesystemScope::active()
+    {
+        return false;
+    }
+    let Some(home) = crate::config::home_dir() else {
+        return false;
+    };
+    let mut words = original_command.split_ascii_whitespace();
+    if words.next() != Some("mv") {
+        return false;
+    }
+    let mut operands = Vec::new();
+    for word in words {
+        if word.starts_with('-') {
+            if !matches!(word, "-n" | "-v" | "-i") || !operands.is_empty() {
+                return false;
+            }
+        } else {
+            let Some(path) = crate::reclaim::literal_absolute_operand(word, &home) else {
+                return false;
+            };
+            operands.push(path);
+        }
+    }
+    let [source, destination] = operands.as_slice() else {
+        return false;
+    };
+    let (Some(directory), Some(destination_parent)) = (source.parent(), destination.parent())
+    else {
+        return false;
+    };
+    if directory != destination_parent
+        || source.file_name() == destination.file_name()
+        || !directory
+            .strip_prefix(&home)
+            .is_ok_and(|suffix| suffix.components().next().is_some())
+        || [source, destination].iter().any(|path| {
+            path.components()
+                .any(|component| component.as_os_str() == ".git")
+                || crate::packs::core::credential_files::names_protected_file(&shell_words::quote(
+                    &path.to_string_lossy(),
+                ))
+        })
+    {
+        return false;
+    }
+    fs::symlink_metadata(source).is_ok()
+        && matches!(
+            fs::symlink_metadata(destination),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        )
+        && crate::path_proof::spelled_suffix_survives_resolution(directory, &home)
+}
+
+/// A directory that a leading `mkdir` in the same command creates before any
+/// redirect runs. With `-p` every missing ancestor is created as well.
+struct LeadingMkdirDir {
+    path: PathBuf,
+    parents: bool,
+}
+
+/// Directories created by a chain of `mkdir [-p] <literal>... &&` segments at
+/// the very start of `command` (`mkdir ~/r/new && cmd > ~/r/new/out.log`).
+///
+/// Only literal absolute or home-anchored operands qualify, so no expansion
+/// can change which directory is made. `&&` guarantees the rest of the command
+/// runs only after every directory exists. Any other option, a relative or
+/// dynamic operand, or a line break ends the chain: the remaining segments get
+/// no created-parent credit.
+fn leading_mkdir_created_dirs(command: &str, home: &Path) -> Vec<LeadingMkdirDir> {
+    let mut created = Vec::new();
+    let mut rest = command.trim_start_matches([' ', '\t']);
+    while let Some(after) = rest
+        .strip_prefix("mkdir")
+        .filter(|after| after.starts_with([' ', '\t']))
+    {
+        let Some((segment, tail)) = after.split_once("&&") else {
+            break;
+        };
+        if segment.contains(['\n', '\r']) {
+            break;
+        }
+        let mut parents = false;
+        let mut paths = Vec::new();
+        for word in segment.split([' ', '\t']).filter(|word| !word.is_empty()) {
+            if matches!(word, "-p" | "--parents") {
+                parents = true;
+            } else if let Some(path) = literal_home_redirect_path(word, home).filter(|path| {
+                !path
+                    .components()
+                    .any(|c| c == std::path::Component::ParentDir)
+            }) {
+                paths.push(path);
+            } else {
+                return created;
+            }
+        }
+        if paths.is_empty() {
+            break;
+        }
+        created.extend(
+            paths
+                .into_iter()
+                .map(|path| LeadingMkdirDir { path, parents }),
+        );
+        rest = tail.trim_start_matches([' ', '\t']);
+    }
+    created
+}
+
+/// Whether `target` is a new file in a directory that does not exist yet but
+/// that a leading `mkdir` in the same command creates (`created`).
+///
+/// A file inside a directory that is about to be made cannot exist, so the
+/// redirect creates and truncates nothing. The directory must still land
+/// inside the home directory: its nearest existing ancestor is resolved
+/// through symlinks and must canonicalise under home. `.`/`..` components and
+/// `.git` internals never qualify.
+fn path_is_new_file_in_created_home_dir(
+    target: &Path,
+    home: &Path,
+    created: &[LeadingMkdirDir],
+) -> bool {
+    if NonlocalFilesystemScope::active()
+        || target.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            ) || component.as_os_str() == ".git"
+        })
+    {
+        return false;
+    }
+    let Some(parent) = target.parent() else {
+        return false;
+    };
+    match fs::symlink_metadata(parent) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => return false,
+    }
+    if !created
+        .iter()
+        .any(|dir| dir.path == parent || (dir.parents && dir.path.starts_with(parent)))
+    {
+        return false;
+    }
+    // Walk up to the nearest entry that exists (a dangling symlink counts as
+    // existing and then fails to canonicalise below).
+    let mut ancestor = parent;
+    loop {
+        let Some(next) = ancestor.parent() else {
+            return false;
+        };
+        ancestor = next;
+        match fs::symlink_metadata(ancestor) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return false,
+        }
+    }
+    let Ok(ancestor) = fs::canonicalize(ancestor) else {
+        return false;
+    };
+    let canonical_home = fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    canonical_home.parent().is_some() && ancestor.starts_with(&canonical_home)
+}
+
 fn redirect_targets_are_new_home_files_with_home(
     command: &str,
     dialect: ShellDialect,
@@ -34421,9 +34681,16 @@ fn redirect_targets_are_new_home_files_with_home(
     let Some(targets) = unquoted_output_redirect_targets(command, dialect) else {
         return false;
     };
+    let created = if dialect == ShellDialect::Posix {
+        leading_mkdir_created_dirs(command, home)
+    } else {
+        Vec::new()
+    };
     targets.into_iter().all(|raw| {
-        literal_home_redirect_path(&raw, home)
-            .is_some_and(|target| path_is_new_file_under_home(&target, home))
+        literal_home_redirect_path(&raw, home).is_some_and(|target| {
+            path_is_new_file_under_home(&target, home)
+                || path_is_new_file_in_created_home_dir(&target, home, &created)
+        })
     })
 }
 
@@ -34588,6 +34855,20 @@ thread_local! {
 
 struct NonlocalFilesystemScope {
     previous: bool,
+}
+
+/// Whether the evaluation on this thread is judging a script that runs on
+/// another machine or namespace, where local filesystem state proves nothing.
+pub(crate) fn nonlocal_filesystem_scope_active() -> bool {
+    NonlocalFilesystemScope::active()
+}
+
+/// Run `body` as if judging a remote script, for tests of filesystem proofs
+/// outside this module.
+#[cfg(test)]
+pub(crate) fn with_nonlocal_filesystem_scope_for_test<T>(body: impl FnOnce() -> T) -> T {
+    let _scope = NonlocalFilesystemScope::enter(true);
+    body()
 }
 
 impl NonlocalFilesystemScope {
@@ -37616,6 +37897,12 @@ fn evaluate_pack_destructive_patterns(
         if matched_span
             .as_ref()
             .is_some_and(|span| span_is_inside_any_segment(*span, ignored_ranges))
+        {
+            continue;
+        }
+
+        if find_delete_is_reclaimable(pack_id, pattern.name, original_command)
+            || mv_is_same_directory_rename(pack_id, pattern.name, original_command)
         {
             continue;
         }

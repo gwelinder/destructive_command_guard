@@ -2653,16 +2653,68 @@ impl RuleTargetExemptions {
             .find(|glob| {
                 glob.pattern
                     .matches_with(&target, RULE_TARGET_GLOB_MATCH_OPTIONS)
+                    && exempt_target_resolves_below_glob_root(&target, glob.pattern.as_str())
             })
             .map(|glob| glob.source.as_str())
     }
 }
 
+/// Whether the real location of `target` is the spelled location: no symlink
+/// below the glob's literal root redirects it.
+///
+/// The glob match itself is lexical, so without this check a link inside an
+/// exempt tree (`~/.claude/jobs/x/tmp/h -> ~`) would carry the exemption to
+/// whatever it points at (`> ~/.claude/jobs/x/tmp/h/.zshrc`,
+/// `rm -rf ~/.claude/jobs/x/tmp/h/`). The literal root of the glob (every
+/// component before the first glob metacharacter) and the target are both
+/// resolved through their deepest existing ancestor; the part of the target
+/// below the root must come out unchanged. Symlinks at or above the root
+/// (`/tmp -> /private/tmp`) are the user's own layout and resolve the same
+/// way on both sides.
+///
+/// A target that is itself a symlink is judged by what it points at, because
+/// a truncating redirect and `rm -rf link/` both follow it. Inside a remote
+/// script (ssh, docker exec) the local filesystem proves nothing, so no
+/// exemption applies there.
+#[cfg(unix)]
+fn exempt_target_resolves_below_glob_root(target: &str, normalized_glob: &str) -> bool {
+    use std::path::{Path, PathBuf};
+
+    if crate::evaluator::nonlocal_filesystem_scope_active() {
+        return false;
+    }
+    let root: Vec<&str> = normalized_glob
+        .split('/')
+        .take_while(|component| !component.contains(['*', '?', '[']))
+        .collect();
+    let root = match root.join("/") {
+        joined if joined.is_empty() && normalized_glob.starts_with('/') => "/".to_string(),
+        joined => joined,
+    };
+    let base = if Path::new(target).is_absolute() {
+        PathBuf::from("/")
+    } else {
+        let Ok(cwd) = std::env::current_dir() else {
+            return false;
+        };
+        cwd
+    };
+    crate::path_proof::spelled_suffix_survives_resolution(&base.join(target), &base.join(root))
+}
+
+/// Windows paths keep the lexical match: canonical Windows paths carry a
+/// verbatim `\\?\` prefix that the normalized globs never spell.
+#[cfg(not(unix))]
+fn exempt_target_resolves_below_glob_root(_target: &str, _normalized_glob: &str) -> bool {
+    true
+}
+
 /// Lexically normalize a candidate target path for glob matching.
 ///
-/// This is deliberately filesystem-free: no `stat`, no symlink resolution, no
-/// canonicalization. A symlinked path is therefore matched by its literal
-/// spelling, exactly as written on the command line.
+/// This step is filesystem-free: no `stat`, no symlink resolution, no
+/// canonicalization, so the glob is matched against the literal spelling.
+/// [`RuleTargetExemptions::matching_glob`] then checks separately that no
+/// symlink below the glob's root redirects that spelling elsewhere.
 ///
 /// Returns `None` unless the text is a static literal path:
 /// - any shell expansion, quoting, or glob byte disqualifies it;

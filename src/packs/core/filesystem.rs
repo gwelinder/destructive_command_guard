@@ -3629,7 +3629,7 @@ fn parse_rm_segment_with_option_scanning(
             .iter()
             .all(|path| path_is_safe_for_style(path, path_style));
 
-    if safe_paths {
+    if safe_paths || rm_targets_are_reclaimable(&paths) {
         return RmParseDecision::Allow;
     }
 
@@ -4183,6 +4183,23 @@ fn rm_targets_exempted_for_rule(pattern_name: &str, paths: &[PathToken<'_>]) -> 
         crate::config::note_rule_target_suppression(&rule_id, glob, target);
     }
     true
+}
+
+/// Whether every `rm` operand is an unquoted literal path whose deletion
+/// removes only disposable data: temp output, updater caches, or project
+/// build output ([`crate::reclaim`]). All-or-nothing, like the exemptions.
+fn rm_targets_are_reclaimable(paths: &[PathToken<'_>]) -> bool {
+    if paths.is_empty() {
+        return false;
+    }
+    let Some(roots) = crate::reclaim::ReclaimRoots::current() else {
+        return false;
+    };
+    paths.iter().all(|path| {
+        path.quote == QuoteKind::None
+            && !path.glued_to_paren
+            && roots.operand_is_reclaimable(path.unquoted)
+    })
 }
 
 fn path_is_safe_for_style(path: &PathToken<'_>, style: RmFlagStyle) -> bool {
