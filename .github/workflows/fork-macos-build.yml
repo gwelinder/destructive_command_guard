@@ -63,8 +63,12 @@ jobs:
           retention-days: 14
           if-no-files-found: ignore
 
+  # The arm64 macOS pool did not pick up a single job on 2026-11-16 (every
+  # job was cancelled after 15 minutes without a runner), so this job runs on
+  # an Intel Mac: it cross-compiles the arm64 release binary, then runs the
+  # suite natively, which covers the macOS-only tests.
   build-and-test:
-    runs-on: macos-15
+    runs-on: macos-15-intel
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v7
@@ -75,6 +79,7 @@ jobs:
         run: |
           channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
           rustup toolchain install "$channel" --profile minimal --component rustfmt,clippy
+          rustup target add aarch64-apple-darwin --toolchain "$channel"
           rustc --version
 
       - name: Install cargo-nextest
@@ -88,15 +93,18 @@ jobs:
             ~/.cargo/git
           key: ${{ runner.os }}-fork-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build release binary
-        run: cargo build --release --locked
+      - name: Build arm64 release binary
+        run: cargo build --release --locked --target aarch64-apple-darwin
 
       - name: Upload release binary
         uses: actions/upload-artifact@v7
         with:
           name: dcg-aarch64-apple-darwin-${{ github.sha }}
-          path: target/release/dcg
+          path: target/aarch64-apple-darwin/release/dcg
           retention-days: 14
+
+      - name: Build native release binary for tests
+        run: cargo build --release --locked
 
       - name: Run the full test suite
         run: cargo nextest run --profile ci --no-fail-fast
