@@ -4220,22 +4220,76 @@ const LITERAL_TEMP_PREFIXES: [&str; 4] =
     ["/tmp/", "/var/tmp/", "/private/tmp/", "/private/var/tmp/"];
 
 fn path_is_safe_unquoted(path: &str) -> bool {
-    LITERAL_TEMP_PREFIXES
-        .iter()
-        .find_map(|prefix| path.strip_prefix(prefix))
-        .is_some_and(temp_path_suffix_is_static_unquoted)
-        || windows_literal_user_temp_subpath(path)
+    split_literal_temp_prefix(path).is_some_and(|(prefix, suffix)| {
+        temp_path_suffix_is_static_unquoted(suffix)
+            && temp_path_lands_in_temp(prefix, glob_free_directory(suffix))
+    }) || windows_literal_user_temp_subpath(path)
 }
 
 fn path_is_safe_double_quoted(path: &str) -> bool {
     // Double quotes do not change literal path text. Keep literal temporary
     // directories in parity with the unquoted path classifier while retaining
     // the same traversal and shell-expansion guards.
+    split_literal_temp_prefix(path).is_some_and(|(prefix, suffix)| {
+        temp_path_suffix_is_static_double_quoted(suffix)
+            && temp_path_lands_in_temp(prefix, &double_quoted_literal(suffix))
+    }) || windows_literal_user_temp_subpath(path)
+}
+
+fn split_literal_temp_prefix(path: &str) -> Option<(&'static str, &str)> {
     LITERAL_TEMP_PREFIXES
         .iter()
-        .find_map(|prefix| path.strip_prefix(prefix))
-        .is_some_and(temp_path_suffix_is_static_double_quoted)
-        || windows_literal_user_temp_subpath(path)
+        .find_map(|prefix| path.strip_prefix(prefix).map(|suffix| (*prefix, suffix)))
+}
+
+/// The directory part of an unquoted temp suffix that names exactly one
+/// place: everything before the component holding the first glob character.
+fn glob_free_directory(suffix: &str) -> &str {
+    suffix.find(['*', '?', '[']).map_or(suffix, |glob| {
+        suffix[..glob]
+            .rsplit_once('/')
+            .map_or("", |(directory, _)| directory)
+    })
+}
+
+/// The text of a static double-quoted word after the shell removes the
+/// backslashes that escape `$`, `` ` ``, `"` and `\`.
+fn double_quoted_literal(text: &str) -> String {
+    let mut literal = String::with_capacity(text.len());
+    let mut characters = text.chars();
+    while let Some(character) = characters.next() {
+        if character != '\\' {
+            literal.push(character);
+            continue;
+        }
+        match characters.next() {
+            Some(escaped @ ('$' | '`' | '"' | '\\')) => literal.push(escaped),
+            Some(other) => {
+                literal.push('\\');
+                literal.push(other);
+            }
+            None => literal.push('\\'),
+        }
+    }
+    literal
+}
+
+/// A literal temp path is only as safe as the place it lands: with
+/// `/tmp/x/link -> ~`, `rm -rf /tmp/x/link/code` deletes `~/code`. The
+/// spelled part below the temp root must survive symlink resolution
+/// unchanged ([`crate::path_proof`]); a target that is itself a symlink does
+/// not, because `rm -rf link/` follows it. A script for another machine is
+/// judged by its spelling alone, since the local filesystem says nothing
+/// about that machine.
+fn temp_path_lands_in_temp(prefix: &str, literal_suffix: &str) -> bool {
+    if crate::evaluator::nonlocal_filesystem_scope_active() {
+        return true;
+    }
+    let root = std::path::Path::new(prefix.trim_end_matches('/'));
+    crate::path_proof::spelled_suffix_survives_resolution(
+        &root.join(literal_suffix.trim_end_matches('/')),
+        root,
+    )
 }
 
 /// Literal per-user Windows temp subpaths (#285), the Windows counterpart of

@@ -348,9 +348,14 @@ fn temp_scratch_can_be_reclaimed_but_not_through_a_link_into_home() {
     sandbox.assert_allows(&format!(
         "S={tmp}\nrm -rf \"$S/scratch-root\"; bun src/cli.ts probe --root \"$S/scratch-root\""
     ));
+    sandbox.assert_allows(&format!("rm -rf \"{tmp}/prove\""));
+    sandbox.assert_allows(&format!("rm -rf {tmp}/prove/*"));
     for command in [
         format!("rm -rf {tmp}/link-home/"),
         format!("rm -rf {tmp}/link-home/code"),
+        format!("rm -rf \"{tmp}/link-home/code\""),
+        format!("rm -rf {tmp}/link-home/*"),
+        format!("rm -rf {tmp}/link-home/code/*.js"),
         format!("find {tmp}/link-home/ -delete"),
         format!("rm -rf {tmp}/link-home/code/app/node_modules/../../.."),
         "rm -rf /tmp".to_string(),
