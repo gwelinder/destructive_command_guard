@@ -17800,9 +17800,12 @@ mod tests {
         assert!(oversized_heredoc_requires_analysis(&large_exterior));
 
         let body = "x".repeat(3 * 1024 * 1024);
-        let unmatched = (0..5)
-            .map(|at| format!("# <<'MISSING{at}'\n"))
-            .collect::<String>();
+        let mut unmatched = String::new();
+        for at in 0..5 {
+            unmatched.push_str("# <<'MISSING");
+            unmatched.push_str(&at.to_string());
+            unmatched.push_str("'\n");
+        }
         let exhausted = format!("{unmatched}cat > notes.txt <<'EOF'\n{body}\nEOF\n");
         assert!(exhausted.len() < MAX_OVERSIZED_HEREDOC_SOURCE_BYTES);
         assert!(oversized_heredoc_requires_analysis(&exhausted));
@@ -19826,7 +19829,10 @@ mod tests {
             // A partial range, or a second unproved edit, invalidates the
             // entire proof rather than silently keeping the successful part.
             for replacements in [
-                vec![replacement.start..replacement.end - 1],
+                vec![std::ops::Range {
+                    start: replacement.start,
+                    end: replacement.end - 1,
+                }],
                 vec![0..proof.len(), replacement],
             ] {
                 assert_eq!(
@@ -19836,7 +19842,11 @@ mod tests {
             }
             let bare = AstGrep::new("((1<<1))", SupportLang::Bash);
             assert_eq!(
-                nested_arithmetic_replacements_proven(&bare, &[0..8], &mut 1024),
+                nested_arithmetic_replacements_proven(
+                    &bare,
+                    &[std::ops::Range { start: 0, end: 8 }],
+                    &mut 1024
+                ),
                 Some(false),
                 "a bare arithmetic/subshell ambiguity cannot prove an edit"
             );
