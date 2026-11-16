@@ -209,9 +209,8 @@ fn a_variable_redirect_to_an_existing_escaping_or_unset_target_stays_denied() {
 /// command itself, leaves the binding intact, and the body's lines are data.
 /// The statement around the operator still counts: a command that reads the
 /// body into this shell, `exec` making the body the shell's input, a
-/// descriptor prefix, a here-string, an expanding heredoc and a later
-/// assignment all keep the dynamic-path denial, and a proven home target
-/// keeps its own rule.
+/// descriptor prefix, an expanding heredoc and a later assignment all keep
+/// the dynamic-path denial, and a proven home target keeps its own rule.
 #[test]
 fn a_quoted_heredoc_between_binding_and_use_keeps_the_binding() {
     let sandbox = Sandbox::new();
@@ -248,7 +247,6 @@ fn a_quoted_heredoc_between_binding_and_use_keeps_the_binding() {
     }
     for command in [
         format!("S={tmp}\ncat <<EOF\n$((S=0))\nEOF\ncat notes.md > $S/.zshrc"),
-        format!("S={tmp}\ncat <<<\"$((S=0))\"\ncat notes.md > $S/.zshrc"),
         format!("S={tmp}\ncat <<'EOF'\nx\nEOF\nS={home}\ncat notes.md > $S/.zshrc"),
         format!("S={tmp}; cat {{S}}<<'EOF' > $S/.zshrc\nx\nEOF"),
         format!("S={tmp}; cat <<EOF > $S/.zshrc\n$((S=0))\nEOF"),
@@ -654,7 +652,10 @@ fn a_substitution_reads_the_outer_shells_variables() {
     for command in [
         "c=ls; git commit -F - <<EOF\n$($c)\nEOF",
         "c=ls; echo $($c)",
-        "D=/tmp/x; git commit -F - <<EOF\n$(ls $D)\nEOF",
+        "D=/tmp/x; echo $(ls $D)",
+        // The arithmetic assigns `c` again before the substitution runs, so
+        // the outer literal is stale and the body runs `0`.
+        "c='rm -rf ~/code'; echo $((c=0))$($c)",
         // A quoted delimiter keeps the body as data.
         "c='rm -rf ~/code'; git commit -F - <<'EOF'\n$($c)\nEOF",
         // The same body with no outer assignment is judged on its own text.

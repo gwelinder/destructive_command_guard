@@ -15709,38 +15709,21 @@ fn evaluate_command_substitutions(
             || source_start.is_some_and(|start| {
                 source_position_receives_automated_stdin(command, start, shell_dialect)
             });
-        let evaluate_body = |text: &str| {
-            evaluate_command_with_pack_order_deadline_at_path_inner(
-                text,
-                enabled_keywords,
-                ordered_packs,
-                keyword_index,
-                compiled_overrides,
-                allowlists,
-                heredoc_settings,
-                allow_once_audit,
-                project_path,
-                deadline,
-                candidate_dialect,
-                nested_command_depth + 1,
-                substitution_automated_stdin,
-            )
-        };
-        let mut result = evaluate_body(&body);
-        // The body alone has lost the outer shell's variables. Judge it once
-        // more behind the outer literal assignments it reads; only a denial
-        // from that reading is kept, so it can never allow more.
-        if candidate_dialect == ShellDialect::Posix
-            && !result.is_denied()
-            && !nested_evaluation_incomplete(&result)
-            && let Some(bound_body) = source_start
-                .and_then(|start| outer_assignments_read_by_substitution(command, start, &body))
-        {
-            let bound = evaluate_body(&bound_body);
-            if bound.is_denied() || nested_evaluation_incomplete(&bound) {
-                result = bound;
-            }
-        }
+        let mut result = evaluate_command_with_pack_order_deadline_at_path_inner(
+            &body,
+            enabled_keywords,
+            ordered_packs,
+            keyword_index,
+            compiled_overrides,
+            allowlists,
+            heredoc_settings,
+            allow_once_audit,
+            project_path,
+            deadline,
+            candidate_dialect,
+            nested_command_depth + 1,
+            substitution_automated_stdin,
+        );
         if nested_evaluation_incomplete(&result) {
             return Some(result);
         }
@@ -15770,6 +15753,32 @@ fn evaluate_command_substitutions(
     None
 }
 
+/// Each POSIX command substitution of `command` whose body reads a name that
+/// an earlier literal assignment sets, as its start offset and the body behind
+/// those assignments. The extraction view matches the one the substitution
+/// pass reads, so a quoted heredoc body and inert interpreter input stay data.
+fn substitution_bodies_behind_outer_assignments(command: &str) -> Vec<(usize, String)> {
+    if !command.contains('=') || (!command.contains("$(") && !command.contains('`')) {
+        return Vec::new();
+    }
+    let data_view = crate::heredoc::mask_non_expanding_data_heredocs(command);
+    let substitution_source = crate::heredoc::mask_inert_interpreter_stdin(data_view.as_ref());
+    // A parse failure was already denied by the substitution pass.
+    let Ok(substitutions) =
+        crate::heredoc::extract_posix_command_substitutions(substitution_source.as_ref())
+    else {
+        return Vec::new();
+    };
+    substitutions
+        .into_iter()
+        .filter(|substitution| !crate::allowlist::is_dcg_self_inspection_call(&substitution.body))
+        .filter_map(|substitution| {
+            outer_assignments_read_by_substitution(command, substitution.start, &substitution.body)
+                .map(|bound_body| (substitution.start, bound_body))
+        })
+        .collect()
+}
+
 /// The body of the substitution at `offset` in `command`, behind the literal
 /// assignment-only statements of `command` that end before it, when the body
 /// reads a name one of them assigns.
@@ -15783,7 +15792,9 @@ fn evaluate_command_substitutions(
 ///
 /// An assignment whose value holds a substitution is left out. The model does
 /// not resolve such a value, and repeating it would evaluate its body again at
-/// every nesting level.
+/// every nesting level. `None` as well when other text before the
+/// substitution may assign a name the body reads (`echo $((c=0))$($c)`): the
+/// literal in front would then be stale.
 fn outer_assignments_read_by_substitution(
     command: &str,
     offset: usize,
@@ -15793,31 +15804,42 @@ fn outer_assignments_read_by_substitution(
         return None;
     }
     let mut bound = String::new();
-    let mut reads_outer_name = false;
+    let mut read_names: Vec<&str> = Vec::new();
+    let mut other_text: Vec<&str> = Vec::new();
     for (start, end) in top_level_segment_ranges(command) {
-        if end > offset {
+        if start >= offset {
             break;
         }
-        let Some(segment) = command.get(start..end) else {
+        let Some(segment) = command.get(start..end.min(offset)) else {
             continue;
         };
-        if segment.contains("$(") || segment.contains('`') {
-            continue;
-        }
-        let names: Vec<&str> = if let Some((name, _)) = posix_executable_assignment_parts(segment) {
+        let names: Vec<&str> = if end > offset || segment.contains("$(") || segment.contains('`') {
+            Vec::new()
+        } else if let Some((name, _)) = posix_executable_assignment_parts(segment) {
             vec![name]
         } else if let Some(parts) = posix_multiple_assignment_parts(segment) {
             parts.into_iter().map(|(name, _)| name).collect()
         } else {
-            continue;
+            Vec::new()
         };
-        reads_outer_name |= names
-            .iter()
-            .any(|name| shell_text_reads_variable(body, name));
+        if names.is_empty() {
+            other_text.push(segment);
+            continue;
+        }
+        read_names.extend(
+            names
+                .into_iter()
+                .filter(|name| shell_text_reads_variable(body, name)),
+        );
         bound.push_str(segment.trim());
         bound.push('\n');
     }
-    reads_outer_name.then(|| {
+    let stale = other_text.iter().any(|text| {
+        read_names.iter().any(|name| {
+            segment_may_rebind_variable(command, text, name, VariableResolution::DenyOnlyLiteral)
+        })
+    });
+    (!read_names.is_empty() && !stale).then(|| {
         bound.push_str(body);
         bound
     })
@@ -17935,6 +17957,53 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
                         info.matched_span = None;
                     }
                 }
+            }
+        }
+    }
+    // A command substitution's body is judged as a command of its own, which
+    // loses the outer shell's variables: `c='rm -rf ~/code'; echo $($c)` ran
+    // `rm` unseen. Read each body that uses an outer literal assignment once
+    // more behind those assignments. Deny wins, and what the user authorized
+    // as written stays authorized, as above. The pass runs only on an allow,
+    // so a denial the command already has keeps its own rule and span.
+    if matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown)
+        && result.decision == EvaluationDecision::Allow
+        && result.bypass_method != Some(BypassMethod::AllowOnce)
+        && !explicitly_allowed_as_written(command, compiled_overrides, allowlists, project_path)
+    {
+        for (start, bound_body) in substitution_bodies_behind_outer_assignments(command) {
+            let alternate = if deadline_exceeded(deadline) {
+                EvaluationResult::indeterminate_due_to_budget()
+            } else {
+                evaluate_command_with_pack_order_deadline_at_path_inner(
+                    &bound_body,
+                    enabled_keywords,
+                    ordered_packs,
+                    keyword_index,
+                    compiled_overrides,
+                    allowlists,
+                    heredoc_settings,
+                    None,
+                    project_path,
+                    deadline,
+                    ShellDialect::Posix,
+                    nested_command_depth + 1,
+                    inherited_automated_stdin
+                        || source_position_receives_automated_stdin(command, start, shell_dialect),
+                )
+            };
+            if matches!(
+                alternate.decision,
+                EvaluationDecision::Deny | EvaluationDecision::Indeterminate
+            ) {
+                result = alternate;
+                // The assignments placed in front have no span in the source.
+                if let Some(info) = result.pattern_info.as_mut() {
+                    info.reason = format!("Command substitution executes: {}", info.reason);
+                    info.matched_span = None;
+                    info.matched_text_preview = None;
+                }
+                break;
             }
         }
     }
@@ -34910,6 +34979,7 @@ fn path_is_new_file_in_created_home_dir(
     canonical_home.parent().is_some() && ancestor.starts_with(&canonical_home)
 }
 
+#[cfg(test)]
 fn redirect_targets_are_new_home_files_with_home(
     command: &str,
     dialect: ShellDialect,
