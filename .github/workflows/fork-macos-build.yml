@@ -13,6 +13,52 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # Fast feedback: the same lint, compile and test gates as upstream ci.yml,
+  # on a Linux runner that starts sooner than the macOS one.
+  linux-suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install the toolchain pinned in rust-toolchain.toml
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal --component rustfmt,clippy
+          rustc --version
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Cache cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-fork-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build release binary for tests
+        run: cargo build --release --locked
+
+      - name: Run the full test suite
+        run: cargo nextest run --profile ci --no-fail-fast
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: junit-linux-${{ github.sha }}
+          path: target/nextest/ci/junit.xml
+          retention-days: 14
+          if-no-files-found: ignore
+
   build-and-test:
     runs-on: macos-15
     timeout-minutes: 240
@@ -50,6 +96,15 @@ jobs:
 
       - name: Run the full test suite
         run: cargo nextest run --profile ci --no-fail-fast
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: junit-macos-${{ github.sha }}
+          path: target/nextest/ci/junit.xml
+          retention-days: 14
+          if-no-files-found: ignore
 
       - name: Run doc tests
         run: cargo test --doc
