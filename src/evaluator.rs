@@ -31966,7 +31966,12 @@ fn resolve_variable_bindings(
         {
             continue;
         }
-        if segment_may_rebind_variable(source, segment, name, mode) {
+        // A `for` header for the name rebinds it in this shell even when it
+        // runs after `&&` or `||`, where it is no parent binding:
+        // `S=/tmp/a && for S in ~; do :; done && echo x > $S/.zshrc`.
+        if posix_for_loop_binds(segment, name)
+            || segment_may_rebind_variable(source, segment, name, mode)
+        {
             return None;
         }
     }

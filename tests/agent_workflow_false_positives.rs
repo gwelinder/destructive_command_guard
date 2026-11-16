@@ -204,6 +204,29 @@ fn a_variable_redirect_to_an_existing_escaping_or_unset_target_stays_denied() {
     }
 }
 
+/// A `for` loop over the name rebinds it in this shell, so a loop between a
+/// literal binding and its use withdraws the binding even when it runs after
+/// `&&` or `||`: `S=/tmp/a && for S in ~; do :; done && echo x > $S/.zshrc`
+/// truncates `~/.zshrc`. 0.14.3 denied these; 0.16.0 allowed the `&&` forms.
+#[test]
+fn a_loop_over_the_name_between_binding_and_use_withdraws_the_binding() {
+    let sandbox = Sandbox::new();
+    let tmp = &sandbox.tmp;
+    for command in [
+        format!("S={tmp} && for S in ~; do :; done && echo x > $S/.zshrc"),
+        format!("S={tmp} && for S in ~; do :; done && cat notes.md > $S/.zshrc"),
+        format!("S={tmp} && for S in ~; do :; done && cat > $S/.zshrc <<'EOF'\nx\nEOF"),
+        format!("S={tmp}; true && for S in ~; do :; done; echo x > $S/.zshrc"),
+        format!("S={tmp} && false || for S in ~; do :; done && echo x > $S/.zshrc"),
+        format!("S={tmp}; for S in ~; do :; done; echo x > $S/.zshrc"),
+    ] {
+        sandbox.assert_denies(&command);
+    }
+    sandbox.assert_allows(&format!(
+        "S={tmp} && for f in a b; do :; done && echo x > $S/notes.md"
+    ));
+}
+
 /// A heredoc whose delimiter is quoted expands nothing, so feeding one to a
 /// command between a literal binding and its use, or to the redirecting
 /// command itself, leaves the binding intact, and the body's lines are data.
